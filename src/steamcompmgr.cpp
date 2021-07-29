@@ -2755,7 +2755,7 @@ register_cm (Display *dpy)
 	w = XCreateSimpleWindow (dpy, RootWindow (dpy, scr), 0, 0, 1, 1, 0, None,
 							 None);
 
-	Xutf8SetWMProperties (dpy, w, "steamcompmgr", "steamcompmgr", NULL, 0, NULL, NULL,
+	Xutf8SetWMProperties (dpy, w, "steamfsrcmgr", "steamfsrcmgr", NULL, 0, NULL, NULL,
 						  NULL);
 
 	Atom atomWmCheck = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
