@@ -24,7 +24,6 @@ struct VulkanPipeline_t
 
 		// These fields below count for the sampler cache
 		bool bFilter;
-		bool bBlackBorder;
 	} layerBindings[ k_nMaxLayers ];
 };
 
@@ -44,6 +43,7 @@ struct Composite_t
 		vec2_t vScale[k_nMaxLayers];
 		vec2_t vOffset[k_nMaxLayers];
 		float flOpacity[k_nMaxLayers];
+		float flBorderAlpha[k_nMaxLayers];
 	} data;
 };
 
@@ -55,7 +55,6 @@ struct Composite_t
 
 extern "C" {
 #define static
-#include <wlr/types/wlr_linux_dmabuf_v1.h>
 #include <wlr/render/dmabuf.h>
 #include <wlr/render/gles2.h>
 #include <wlr/render/interface.h>
@@ -69,12 +68,12 @@ extern "C" {
 struct VulkanRenderer_t
 {
 	struct wlr_renderer base;
-	struct wlr_renderer *parent;
 };
 
 struct VulkanWlrTexture_t
 {
 	struct wlr_texture base;
+	struct wlr_buffer *buf;
 };
 
 class CVulkanTexture
@@ -124,19 +123,25 @@ public:
 	VkFormat m_format = VK_FORMAT_UNDEFINED;
 };
 
-extern std::vector< const char * > g_vecSDLInstanceExts;
 extern bool g_vulkanSupportsModifiers;
 
-int vulkan_init(void);
+extern bool g_vulkanHasDrmPrimaryDevId;
+extern dev_t g_vulkanDrmPrimaryDevId;
+
+bool vulkan_init(void);
+bool vulkan_init_formats(void);
+bool vulkan_make_output(void);
 
 VulkanTexture_t vulkan_create_texture_from_dmabuf( struct wlr_dmabuf_attributes *pDMA );
-VulkanTexture_t vulkan_create_texture_from_bits( uint32_t width, uint32_t height, VkFormat format, void *bits );
+VulkanTexture_t vulkan_create_texture_from_bits( uint32_t width, uint32_t height, VkFormat format, CVulkanTexture::createFlags texCreateFlags, void *bits );
+VulkanTexture_t vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf );
 
 uint32_t vulkan_texture_get_fbid( VulkanTexture_t vulkanTex );
+int vulkan_texture_get_fence( VulkanTexture_t vulkanTex );
 
 void vulkan_free_texture( VulkanTexture_t vulkanTex );
 
-bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline, bool bScreenshot );
+bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline, CVulkanTexture **pScreenshotTexture );
 uint32_t vulkan_get_last_composite_fbid( void );
 
 void vulkan_present_to_window( void );
@@ -146,4 +151,4 @@ bool vulkan_remake_swapchain( void );
 bool vulkan_remake_output_images( void );
 bool acquire_next_image( void );
 
-struct wlr_renderer *vulkan_renderer_create( struct wlr_renderer *parent );
+struct wlr_renderer *vulkan_renderer_create( void );

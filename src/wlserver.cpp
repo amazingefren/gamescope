@@ -1,12 +1,10 @@
 #define _GNU_SOURCE 1
 
 #include <assert.h>
-#include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <stdio.h> 
-#include <string.h> 
+#include <string.h>
 #include <poll.h>
 
 #include <map>
@@ -26,6 +24,8 @@ extern "C" {
 #include <wlr/backend/multi.h>
 #include <wlr/backend/libinput.h>
 #include <wlr/backend/noop.h>
+#include <wlr/interfaces/wlr_input_device.h>
+#include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_pointer.h>
@@ -37,19 +37,25 @@ extern "C" {
 }
 
 #include "gamescope-xwayland-protocol.h"
+#include "gamescope-pipewire-protocol.h"
 
 #include "wlserver.hpp"
 #include "drm.hpp"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
+#include "log.hpp"
+
+#if HAVE_PIPEWIRE
+#include "pipewire.hpp"
+#endif
 
 #include "gpuvis_trace_utils.h"
 
-static struct wlserver_t wlserver;
+static LogScope wl_log("wlserver");
 
-Display *g_XWLDpy;
+static struct wlserver_t wlserver = {};
 
-bool run = true;
+static Display *g_XWLDpy = nullptr;
 
 struct wlserver_content_override {
 	struct wlr_surface *surface;
@@ -57,7 +63,7 @@ struct wlserver_content_override {
 	struct wl_listener surface_destroy_listener;
 };
 
-std::map<uint32_t, struct wlserver_content_override *> content_overrides;
+static std::map<uint32_t, struct wlserver_content_override *> content_overrides;
 
 enum wlserver_touch_click_mode g_nTouchClickMode = WLSERVER_TOUCH_CLICK_LEFT;
 
@@ -67,29 +73,18 @@ static bool bXwaylandReady = false;
 
 static void wlserver_surface_set_wlr( struct wlserver_surface *surf, struct wlr_surface *wlr_surf );
 
-void sig_handler(int signal)
-{
-	if ( signal == SIGUSR2 )
-	{
-		g_bTakeScreenshot = true;
-		return;
-	}
-
-	wlr_log(WLR_DEBUG, "Received kill signal. Terminating!");
-	run = false;
-}
-
 extern const struct wlr_surface_role xwayland_surface_role;
 
 void xwayland_surface_role_commit(struct wlr_surface *wlr_surface) {
 	assert(wlr_surface->role == &xwayland_surface_role);
 
-	if ( wlr_surface->buffer == NULL )
+	VulkanWlrTexture_t *tex = (VulkanWlrTexture_t *) wlr_surface_get_texture( wlr_surface );
+	if ( tex == NULL )
 	{
 		return;
 	}
 
-	struct wlr_buffer *buf = wlr_buffer_lock( &wlr_surface->buffer->base );
+	struct wlr_buffer *buf = wlr_buffer_lock( tex->buf );
 
 	gpuvis_trace_printf( "xwayland_surface_role_commit wlr_surface %p", wlr_surface );
 
@@ -120,7 +115,7 @@ struct wl_listener xwayland_ready_listener = { .notify = xwayland_ready };
 static void wlserver_handle_modifiers(struct wl_listener *listener, void *data)
 {
 	struct wlserver_keyboard *keyboard = wl_container_of( listener, keyboard, modifiers );
-	
+
 	wlr_seat_set_keyboard( wlserver.wlr.seat, keyboard->device );
 	wlr_seat_keyboard_notify_modifiers( wlserver.wlr.seat, &keyboard->device->keyboard->modifiers );
 }
@@ -146,24 +141,24 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 static void wlserver_movecursor( int x, int y )
 {
 	wlserver.mouse_surface_cursorx += x;
-	
+
 	if ( wlserver.mouse_surface_cursorx > wlserver.mouse_focus_surface->current.width - 1 )
 	{
 		wlserver.mouse_surface_cursorx = wlserver.mouse_focus_surface->current.width - 1;
 	}
-	
+
 	if ( wlserver.mouse_surface_cursorx < 0 )
 	{
 		wlserver.mouse_surface_cursorx = 0;
 	}
-	
+
 	wlserver.mouse_surface_cursory += y;
-	
+
 	if ( wlserver.mouse_surface_cursory > wlserver.mouse_focus_surface->current.height - 1 )
 	{
 		wlserver.mouse_surface_cursory = wlserver.mouse_focus_surface->current.height - 1;
 	}
-	
+
 	if ( wlserver.mouse_surface_cursory < 0 )
 	{
 		wlserver.mouse_surface_cursory = 0;
@@ -174,13 +169,12 @@ static void wlserver_handle_pointer_motion(struct wl_listener *listener, void *d
 {
 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, motion );
 	struct wlr_event_pointer_motion *event = (struct wlr_event_pointer_motion *) data;
-	
+
 	if ( wlserver.mouse_focus_surface != NULL )
 	{
 		wlserver_movecursor( event->unaccel_dx, event->unaccel_dy );
 
 		wlr_seat_pointer_notify_motion( wlserver.wlr.seat, event->time_msec, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
-		wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 	}
 }
 
@@ -188,8 +182,20 @@ static void wlserver_handle_pointer_button(struct wl_listener *listener, void *d
 {
 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, button );
 	struct wlr_event_pointer_button *event = (struct wlr_event_pointer_button *) data;
-	
+
 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, event->time_msec, event->button, event->state );
+}
+
+static void wlserver_handle_pointer_axis(struct wl_listener *listener, void *data)
+{
+	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, axis );
+	struct wlr_event_pointer_axis *event = (struct wlr_event_pointer_axis *) data;
+
+	wlr_seat_pointer_notify_axis( wlserver.wlr.seat, event->time_msec, event->orientation, event->delta, event->delta_discrete, event->source );
+}
+
+static void wlserver_handle_pointer_frame(struct wl_listener *listener, void *data)
+{
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 }
 
@@ -213,12 +219,12 @@ static void wlserver_handle_touch_down(struct wl_listener *listener, void *data)
 {
 	struct wlserver_touch *touch = wl_container_of( listener, touch, down );
 	struct wlr_event_touch_down *event = (struct wlr_event_touch_down *) data;
-	
+
 	if ( wlserver.mouse_focus_surface != NULL )
 	{
 		double x = g_bRotated ? event->y : event->x;
 		double y = g_bRotated ? 1.0 - event->x : event->y;
-		
+
 		x *= g_nOutputWidth;
 		y *= g_nOutputHeight;
 
@@ -306,7 +312,7 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 {
 	struct wlserver_touch *touch = wl_container_of( listener, touch, motion );
 	struct wlr_event_touch_motion *event = (struct wlr_event_touch_motion *) data;
-	
+
 	if ( wlserver.mouse_focus_surface != NULL )
 	{
 		double x = g_bRotated ? event->y : event->x;
@@ -351,46 +357,53 @@ static void wlserver_new_input(struct wl_listener *listener, void *data)
 		case WLR_INPUT_DEVICE_KEYBOARD:
 		{
 			struct wlserver_keyboard *pKB = (struct wlserver_keyboard *) calloc( 1, sizeof( struct wlserver_keyboard ) );
-			
+
 			pKB->device = device;
-			
+
 			struct xkb_rule_names rules = { 0 };
 			struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-			struct xkb_keymap *keymap = xkb_map_new_from_names(context, &rules,
+			rules.rules = getenv("XKB_DEFAULT_RULES");
+			rules.model = getenv("XKB_DEFAULT_MODEL");
+			rules.layout = getenv("XKB_DEFAULT_LAYOUT");
+			rules.variant = getenv("XKB_DEFAULT_VARIANT");
+			rules.options = getenv("XKB_DEFAULT_OPTIONS");
+			struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &rules,
 															   XKB_KEYMAP_COMPILE_NO_FLAGS);
-			
+
 			wlr_keyboard_set_keymap(device->keyboard, keymap);
 			xkb_keymap_unref(keymap);
 			xkb_context_unref(context);
 			wlr_keyboard_set_repeat_info(device->keyboard, 25, 600);
-			
+
 			pKB->modifiers.notify = wlserver_handle_modifiers;
 			wl_signal_add( &device->keyboard->events.modifiers, &pKB->modifiers );
-			
+
 			pKB->key.notify = wlserver_handle_key;
 			wl_signal_add( &device->keyboard->events.key, &pKB->key );
-			
-			wlr_seat_set_keyboard( wlserver.wlr.seat, device );
 		}
 		break;
 		case WLR_INPUT_DEVICE_POINTER:
 		{
 			struct wlserver_pointer *pointer = (struct wlserver_pointer *) calloc( 1, sizeof( struct wlserver_pointer ) );
-			
+
 			pointer->device = device;
 
 			pointer->motion.notify = wlserver_handle_pointer_motion;
 			wl_signal_add( &device->pointer->events.motion, &pointer->motion );
 			pointer->button.notify = wlserver_handle_pointer_button;
 			wl_signal_add( &device->pointer->events.button, &pointer->button );
+			pointer->axis.notify = wlserver_handle_pointer_axis;
+			wl_signal_add( &device->pointer->events.axis, &pointer->axis);
+			pointer->frame.notify = wlserver_handle_pointer_frame;
+			wl_signal_add( &device->pointer->events.frame, &pointer->frame);
 		}
 		break;
 		case WLR_INPUT_DEVICE_TOUCH:
 		{
 			struct wlserver_touch *touch = (struct wlserver_touch *) calloc( 1, sizeof( struct wlserver_touch ) );
-			
+
 			touch->device = device;
-			
+
 			touch->down.notify = wlserver_handle_touch_down;
 			wl_signal_add( &device->touch->events.down, &touch->down );
 			touch->up.notify = wlserver_handle_touch_up;
@@ -414,7 +427,7 @@ static void wlserver_new_surface(struct wl_listener *l, void *data)
 	struct wlserver_surface *s, *tmp;
 	wl_list_for_each_safe(s, tmp, &pending_surfaces, pending_link)
 	{
-		if (s->wl_id == id && s->wlr == nullptr)
+		if (s->wl_id == (long)id && s->wlr == nullptr)
 		{
 			wlserver_surface_set_wlr( s, wlr_surf );
 		}
@@ -474,6 +487,31 @@ static void create_gamescope_xwayland( void )
 	wl_global_create( wlserver.display, &gamescope_xwayland_interface, version, NULL, gamescope_xwayland_bind );
 }
 
+#if HAVE_PIPEWIRE
+static void gamescope_pipewire_handle_destroy( struct wl_client *client, struct wl_resource *resource )
+{
+	wl_resource_destroy( resource );
+}
+
+static const struct gamescope_pipewire_interface gamescope_pipewire_impl = {
+	.destroy = gamescope_pipewire_handle_destroy,
+};
+
+static void gamescope_pipewire_bind( struct wl_client *client, void *data, uint32_t version, uint32_t id )
+{
+	struct wl_resource *resource = wl_resource_create( client, &gamescope_pipewire_interface, version, id );
+	wl_resource_set_implementation( resource, &gamescope_pipewire_impl, NULL, NULL );
+
+	gamescope_pipewire_send_stream_node( resource, get_pipewire_stream_node_id() );
+}
+
+static void create_gamescope_pipewire( void )
+{
+	uint32_t version = 1;
+	wl_global_create( wlserver.display, &gamescope_pipewire_interface, version, NULL, gamescope_pipewire_bind );
+}
+#endif
+
 static void handle_session_active( struct wl_listener *listener, void *data )
 {
 	if (wlserver.wlr.session->active) {
@@ -481,33 +519,54 @@ static void handle_session_active( struct wl_listener *listener, void *data )
 		g_DRM.needs_modeset = true;
 	}
 	g_DRM.paused = !wlserver.wlr.session->active;
-	fprintf( stderr, "wlserver: session %s\n", g_DRM.paused ? "paused" : "resumed" );
+	wl_log.infof( "Session %s", g_DRM.paused ? "paused" : "resumed" );
 }
 
-int wlsession_init( void ) {
-	wlr_log_init(WLR_DEBUG, NULL);
+static void handle_wlr_log(enum wlr_log_importance importance, const char *fmt, va_list args)
+{
+	enum LogPriority prio;
+	switch (importance) {
+	case WLR_ERROR:
+		prio = LOG_ERROR;
+		break;
+	case WLR_INFO:
+		prio = LOG_INFO;
+		break;
+	default:
+		prio = LOG_DEBUG;
+		break;
+	}
+
+	wl_log.vlogf(prio, fmt, args);
+}
+
+bool wlsession_init( void ) {
+	wlr_log_init(WLR_DEBUG, handle_wlr_log);
+
 	wlserver.display = wl_display_create();
 
 	if ( BIsNested() )
-		return 0;
+		return true;
 
 	wlserver.wlr.session = wlr_session_create( wlserver.display );
 	if ( wlserver.wlr.session == nullptr )
 	{
-		fprintf( stderr, "Failed to create session\n" );
-		return 1;
+		wl_log.errorf( "Failed to create session" );
+		return false;
 	}
 
 	wlserver.session_active.notify = handle_session_active;
 	wl_signal_add( &wlserver.wlr.session->events.active, &wlserver.session_active );
 
-	return 0;
+	return true;
 }
 
 static void kms_device_handle_change( struct wl_listener *listener, void *data )
 {
 	g_DRM.out_of_date = true;
-	fprintf( stderr, "wlserver: got change event for KMS device\n" );
+	wl_log.infof( "Got change event for KMS device" );
+
+	nudge_steamcompmgr();
 }
 
 int wlsession_open_kms( const char *device_name ) {
@@ -519,7 +578,7 @@ int wlsession_open_kms( const char *device_name ) {
 			return -1;
 		if ( !drmIsKMS( device->fd ) )
 		{
-			wlr_log( WLR_ERROR, "'%s' is not a KMS device", device_name );
+			wl_log.errorf( "'%s' is not a KMS device", device_name );
 			wlr_session_close_file( wlserver.wlr.session, device );
 			return -1;
 		}
@@ -529,12 +588,12 @@ int wlsession_open_kms( const char *device_name ) {
 		ssize_t n = wlr_session_find_gpus( wlserver.wlr.session, 1, &device );
 		if ( n < 0 )
 		{
-			wlr_log( WLR_ERROR, "Failed to list GPUs" );
+			wl_log.errorf( "Failed to list GPUs" );
 			return -1;
 		}
 		if ( n == 0 )
 		{
-			wlr_log( WLR_ERROR, "No GPU detected" );
+			wl_log.errorf( "No GPU detected" );
 			return -1;
 		}
 	}
@@ -546,54 +605,52 @@ int wlsession_open_kms( const char *device_name ) {
 	return device->fd;
 }
 
-int wlserver_init(int argc, char **argv, bool bIsNested) {
+bool wlserver_init( void ) {
 	assert( wlserver.display != nullptr );
 
-	bool bIsDRM = bIsNested == false;
+	bool bIsDRM = !BIsNested();
 
 	wl_list_init(&pending_surfaces);
-
-	signal(SIGTERM, sig_handler);
-	signal(SIGINT, sig_handler);
-	signal(SIGUSR2, sig_handler);
 
 	wlserver.event_loop = wl_display_get_event_loop(wlserver.display);
 
 	wlserver.wlr.multi_backend = wlr_multi_backend_create(wlserver.display);
 
-	assert( wlserver.display && wlserver.event_loop && wlserver.wlr.multi_backend );
+	assert( wlserver.event_loop && wlserver.wlr.multi_backend );
 
 	wl_signal_add( &wlserver.wlr.multi_backend->events.new_input, &new_input_listener );
-
-	wlserver.wlr.headless_backend = wlr_headless_backend_create( wlserver.display );
-	if ( wlserver.wlr.headless_backend == NULL )
-	{
-		return 1;
-	}
-	wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.headless_backend );
 
 	wlserver.wlr.noop_backend = wlr_noop_backend_create( wlserver.display );
 	wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.noop_backend );
 
 	wlserver.wlr.output = wlr_noop_add_output( wlserver.wlr.noop_backend );
 
+	struct wlr_input_device *kbd_dev = nullptr;
 	if ( bIsDRM == True )
 	{
 		wlserver.wlr.libinput_backend = wlr_libinput_backend_create( wlserver.display, wlserver.wlr.session );
 		if ( wlserver.wlr.libinput_backend == NULL)
 		{
-			return 1;
+			return false;
 		}
 		wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.libinput_backend );
 	}
 	else
 	{
-		wlr_headless_add_input_device( wlserver.wlr.headless_backend, WLR_INPUT_DEVICE_KEYBOARD );
+		// Create a stub wlr_keyboard only used to set the keymap
+		struct wlr_keyboard *kbd = (struct wlr_keyboard *) calloc(1, sizeof(*kbd));
+		wlr_keyboard_init(kbd, nullptr);
+
+		kbd_dev = (struct wlr_input_device *) calloc(1, sizeof(*kbd_dev));
+		wlr_input_device_init(kbd_dev, WLR_INPUT_DEVICE_KEYBOARD, nullptr, "noop", 0, 0);
+		kbd_dev->keyboard = kbd;
+
+		wlserver.wlr.virtual_keyboard_device = kbd_dev;
+
+		// We need to wait for the backend to be started before adding the device
 	}
 
-	struct wlr_renderer *headless_renderer = wlr_backend_get_renderer( wlserver.wlr.multi_backend );
-	assert( headless_renderer );
-	wlserver.wlr.renderer = vulkan_renderer_create( headless_renderer );
+	wlserver.wlr.renderer = vulkan_renderer_create();
 
 	wlr_renderer_init_wl_display(wlserver.wlr.renderer, wlserver.display);
 
@@ -602,13 +659,10 @@ int wlserver_init(int argc, char **argv, bool bIsNested) {
 	wl_signal_add( &wlserver.wlr.compositor->events.new_surface, &new_surface_listener );
 
 	create_gamescope_xwayland();
-	
-	struct wlr_xwayland_server_options xwayland_options = {
-		.lazy = false,
-		.enable_wm = false,
-	};
-	wlserver.wlr.xwayland_server = wlr_xwayland_server_create(wlserver.display, &xwayland_options);
-	wl_signal_add(&wlserver.wlr.xwayland_server->events.ready, &xwayland_ready_listener);
+
+#if HAVE_PIPEWIRE
+	create_gamescope_pipewire();
+#endif
 
 	int result = -1;
 	int display_slot = 0;
@@ -622,46 +676,65 @@ int wlserver_init(int argc, char **argv, bool bIsNested) {
 
 	if ( result != 0 )
 	{
-		wlr_log_errno(WLR_ERROR, "Unable to open wayland socket");
+		wl_log.errorf_errno("Unable to open wayland socket");
 		wlr_backend_destroy( wlserver.wlr.multi_backend );
-		return 1;
+		return false;
 	}
 
 	wlserver.wlr.seat = wlr_seat_create(wlserver.display, "seat0");
 	wlr_seat_set_capabilities( wlserver.wlr.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_TOUCH );
 
-	wlr_log(WLR_INFO, "Running compositor on wayland display '%s'", wlserver.wl_display_name);
+	wl_log.infof("Running compositor on wayland display '%s'", wlserver.wl_display_name);
 
 	if (!wlr_backend_start( wlserver.wlr.multi_backend ))
 	{
-		wlr_log(WLR_ERROR, "Failed to start backend");
+		wl_log.errorf("Failed to start backend");
 		wlr_backend_destroy( wlserver.wlr.multi_backend );
 		wl_display_destroy(wlserver.display);
-		return 1;
+		return false;
 	}
+
+	if ( kbd_dev != nullptr )
+		wl_signal_emit( &wlserver.wlr.multi_backend->events.new_input, kbd_dev );
+
+	int refresh = g_nNestedRefresh;
+	if (refresh == 0) {
+		refresh = g_nOutputRefresh;
+	}
+
+	wlr_output_enable( wlserver.wlr.output, true );
+	wlr_output_set_custom_mode( wlserver.wlr.output, g_nNestedWidth, g_nNestedHeight, refresh * 1000 );
+	if ( !wlr_output_commit( wlserver.wlr.output ) )
+	{
+		wl_log.errorf("Failed to commit noop output");
+		return false;
+	}
+
+	wlr_output_create_global( wlserver.wlr.output );
+
+	struct wlr_xwayland_server_options xwayland_options = {
+		.lazy = false,
+		.enable_wm = false,
+	};
+	wlserver.wlr.xwayland_server = wlr_xwayland_server_create(wlserver.display, &xwayland_options);
+	wl_signal_add(&wlserver.wlr.xwayland_server->events.ready, &xwayland_ready_listener);
 
 	while (!bXwaylandReady) {
 		wl_display_flush_clients(wlserver.display);
 		if (wl_event_loop_dispatch(wlserver.event_loop, -1) < 0) {
-			fprintf(stderr, "wlserver: wl_event_loop_dispatch failed\n");
-			return 1;
+			wl_log.errorf("wl_event_loop_dispatch failed\n");
+			return false;
 		}
 	}
 
 	g_XWLDpy = XOpenDisplay( wlserver.wlr.xwayland_server->display_name );
 	if ( g_XWLDpy == nullptr )
 	{
-		wlr_log( WLR_ERROR, "wlserver: failed to connect to X11 server\n" );
-		return 1;
+		wl_log.errorf( "Failed to connect to X11 server" );
+		return false;
 	}
 
-	wlr_output_enable( wlserver.wlr.output, true );
-	wlr_output_set_custom_mode( wlserver.wlr.output, g_nNestedWidth, g_nNestedHeight, g_nOutputRefresh * 1000 );
-	wlr_output_commit( wlserver.wlr.output );
-
-	wlr_output_create_global( wlserver.wlr.output );
-
-	return 0;
+	return true;
 }
 
 pthread_mutex_t waylock = PTHREAD_MUTEX_INITIALIZER;
@@ -677,23 +750,23 @@ void wlserver_unlock(void)
 	pthread_mutex_unlock(&waylock);
 }
 
-int wlserver_run(void)
+void wlserver_run(void)
 {
 	struct pollfd pollfd = {
 		.fd = wl_event_loop_get_fd( wlserver.event_loop ),
 		.events = POLLIN,
 	};
-	while ( run ) {
+	while ( g_bRun ) {
 		int ret = poll( &pollfd, 1, -1 );
 		if ( ret < 0 ) {
 			if ( errno == EINTR )
 				continue;
-			perror( "wlserver: poll failed" );
+			wl_log.errorf_errno( "poll failed" );
 			break;
 		}
 
 		if ( pollfd.revents & (POLLHUP | POLLERR) ) {
-			fprintf( stderr, "wlserver: socket %s\n", ( pollfd.revents & POLLERR ) ? "error" : "closed" );
+			wl_log.errorf( "socket %s", ( pollfd.revents & POLLERR ) ? "error" : "closed" );
 			break;
 		}
 
@@ -716,28 +789,38 @@ int wlserver_run(void)
 	wlr_xwayland_server_destroy(wlserver.wlr.xwayland_server);
 	wl_display_destroy_clients(wlserver.display);
 	wl_display_destroy(wlserver.display);
-	return 0;
 }
 
 void wlserver_keyboardfocus( struct wlr_surface *surface )
 {
 	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard( wlserver.wlr.seat );
-	if ( keyboard != NULL )
-	{
+	if ( keyboard == nullptr )
+		wlr_seat_keyboard_notify_enter( wlserver.wlr.seat, surface, nullptr, 0, nullptr);
+	else
 		wlr_seat_keyboard_notify_enter( wlserver.wlr.seat, surface, keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
-	}
 }
 
 void wlserver_key( uint32_t key, bool press, uint32_t time )
 {
+	assert( wlserver.wlr.virtual_keyboard_device != nullptr );
+	wlr_seat_set_keyboard( wlserver.wlr.seat, wlserver.wlr.virtual_keyboard_device );
 	wlr_seat_keyboard_notify_key( wlserver.wlr.seat, time, key, press );
 }
 
-void wlserver_mousefocus( struct wlr_surface *wlrsurface )
+void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x /* = 0 */, int y /* = 0 */ )
 {
 	wlserver.mouse_focus_surface = wlrsurface;
-	wlserver.mouse_surface_cursorx = wlrsurface->current.width / 2.0;
-	wlserver.mouse_surface_cursory = wlrsurface->current.height / 2.0;
+
+	if ( x < wlrsurface->current.width && y < wlrsurface->current.height )
+	{
+		wlserver.mouse_surface_cursorx = x;
+		wlserver.mouse_surface_cursory = y;
+	}
+	else
+	{
+		wlserver.mouse_surface_cursorx = wlrsurface->current.width / 2.0;
+		wlserver.mouse_surface_cursory = wlrsurface->current.height / 2.0;
+	}
 	wlr_seat_pointer_notify_enter( wlserver.wlr.seat, wlrsurface, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
 }
 
@@ -805,7 +888,7 @@ static void wlserver_surface_set_wlr( struct wlserver_surface *surf, struct wlr_
 
 	if ( !wlr_surface_set_role(wlr_surf, &xwayland_surface_role, NULL, NULL, 0 ) )
 	{
-		fprintf (stderr, "Failed to set xwayland surface role");
+		wl_log.errorf("Failed to set xwayland surface role");
 	}
 }
 
@@ -822,7 +905,7 @@ void wlserver_surface_set_wl_id( struct wlserver_surface *surf, long id )
 {
 	if ( surf->wl_id != 0 )
 	{
-		fprintf( stderr, "surf->wl_id already set, was %lu, set %lu\n", surf->wl_id, id );
+		wl_log.errorf( "surf->wl_id already set, was %lu, set %lu", surf->wl_id, id );
 		return;
 	}
 

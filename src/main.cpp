@@ -5,9 +5,12 @@
 #include <vector>
 #include <cstring>
 #include <sys/capability.h>
+#include <sys/stat.h>
 
+#include <getopt.h>
 #include <signal.h>
 #include <unistd.h>
+#include <float.h>
 
 #include "main.hpp"
 #include "steamcompmgr.hpp"
@@ -17,8 +20,93 @@
 #include "wlserver.hpp"
 #include "gpuvis_trace_utils.h"
 
-int ac;
-char **av;
+#if HAVE_PIPEWIRE
+#include "pipewire.hpp"
+#endif
+
+const char *gamescope_optstring = nullptr;
+
+const struct option *gamescope_options = (struct option[]){
+	{ "help", no_argument, nullptr, 0 },
+	{ "nested-width", required_argument, nullptr, 'w' },
+	{ "nested-height", required_argument, nullptr, 'h' },
+	{ "nested-refresh", required_argument, nullptr, 'r' },
+	{ "max-scale", required_argument, nullptr, 'm' },
+	{ "integer-scale", no_argument, nullptr, 'i' },
+	{ "output-width", required_argument, nullptr, 'W' },
+	{ "output-height", required_argument, nullptr, 'H' },
+	{ "nearest-neighbor-filter", no_argument, nullptr, 'n' },
+
+	// nested mode options
+	{ "nested-unfocused-refresh", required_argument, nullptr, 'o' },
+	{ "borderless", no_argument, nullptr, 'b' },
+	{ "fullscreen", no_argument, nullptr, 'f' },
+
+	// embedded mode options
+	{ "disable-layers", no_argument, nullptr, 0 },
+	{ "debug-layers", no_argument, nullptr, 0 },
+	{ "prefer-output", required_argument, nullptr, 'O' },
+
+	// steamcompmgr options
+	{ "cursor", required_argument, nullptr, 0 },
+	{ "ready-fd", required_argument, nullptr, 'R' },
+	{ "stats-path", required_argument, nullptr, 'T' },
+	{ "hide-cursor-delay", required_argument, nullptr, 'C' },
+	{ "debug-focus", no_argument, nullptr, 0 },
+	{ "synchronous-x11", no_argument, nullptr, 0 },
+	{ "debug-hud", no_argument, nullptr, 'v' },
+	{ "debug-events", no_argument, nullptr, 0 },
+	{ "steam", no_argument, nullptr, 'e' },
+	{ "force-composition", no_argument, nullptr, 'c' },
+	{ "disable-xres", no_argument, nullptr, 'x' },
+
+	{} // keep last
+};
+
+const char usage[] =
+	"usage: gamescope [options...] -- [command...]\n"
+	"\n"
+	"Options:\n"
+	"  --help                         show help message\n"
+	"  -w, --nested-width             game width\n"
+	"  -h, --nested-height            game height\n"
+	"  -r, --nested-refresh           game refresh rate (frames per second)\n"
+	"  -m, --max-scale                maximum scale factor\n"
+	"  -i, --integer-scale            force scale factor to integer\n"
+	"  -W, --output-width             output width\n"
+	"  -H, --output-height            output height\n"
+	"  -n, --nearest-neighbor-filter  use nearest neighbor filtering\n"
+	"  --cursor                       path to default cursor image\n"
+	"  -R, --ready-fd                 notify FD when ready\n"
+	"  -T, --stats-path               write statistics to path\n"
+	"  -C, --hide-cursor-delay        hide cursor image after delay\n"
+	"  -e, --steam                    enable Steam integration\n"
+	"\n"
+	"Nested mode options:\n"
+	"  -o, --nested-unfocused-refresh game refresh rate when unfocused\n"
+	"  -b, --borderless               make the window borderless\n"
+	"  -f, --fullscreen               make the window fullscreen\n"
+	"\n"
+	"Embedded mode options:\n"
+	"  -O, --prefer-output            list of connectors in order of preference\n"
+	"\n"
+	"Debug options:\n"
+	"  --disable-layers               disable libliftoff (hardware planes)\n"
+	"  --debug-layers                 debug libliftoff\n"
+	"  --debug-focus                  debug XWM focus\n"
+	"  --synchronous-x11              force X11 connection synchronization\n"
+	"  --debug-hud                    paint HUD with debug info\n"
+	"  --debug-events                 debug X11 events\n"
+	"  --force-composition            disable direct scan-out\n"
+	"  --disable-xres                 disable XRes for PID lookup\n"
+	"\n"
+	"Keyboard shortcuts:\n"
+	"  Super + F                      toggle fullscreen\n"
+	"  Super + N                      toggle nearest neighbour filtering\n"
+	"  Super + S                      take a screenshot\n"
+	"";
+
+std::atomic< bool > g_bRun{true};
 
 int g_nNestedWidth = 0;
 int g_nNestedHeight = 0;
@@ -27,7 +115,7 @@ int g_nNestedUnfocusedRefresh = 0;
 
 uint32_t g_nOutputWidth = 0;
 uint32_t g_nOutputHeight = 0;
-int g_nOutputRefresh = 60;
+int g_nOutputRefresh = 0;
 
 bool g_bFullscreen = false;
 
@@ -37,29 +125,70 @@ bool g_bFilterGameWindow = true;
 
 bool g_bBorderlessOutputWindow = false;
 
-bool g_bTakeScreenshot = false;
-
 bool g_bNiceCap = false;
 int g_nOldNice = 0;
 int g_nNewNice = 0;
 
+float g_flMaxWindowScale = FLT_MAX;
+bool g_bIntegerScale = false;
+
 pthread_t g_mainThread;
 
-int BIsNested()
+bool BIsNested()
 {
-	return g_bIsNested == true;
+	return g_bIsNested;
+}
+
+static bool initOutput(int preferredWidth, int preferredHeight, int preferredRefresh);
+static void steamCompMgrThreadRun(int argc, char **argv);
+
+static std::string build_optstring(const struct option *options)
+{
+	std::string optstring;
+	for (size_t i = 0; options[i].name != nullptr; i++) {
+		if (!options[i].name || !options[i].val)
+			continue;
+
+		assert(optstring.find((char) options[i].val) == std::string::npos);
+
+		char str[] = { (char) options[i].val, '\0' };
+		optstring.append(str);
+
+		if (options[i].has_arg)
+			optstring.append(":");
+	}
+	return optstring;
+}
+
+static void handle_signal( int sig )
+{
+	switch ( sig ) {
+	case SIGUSR2:
+		take_screenshot();
+		break;
+	case SIGTERM:
+	case SIGINT:
+		fprintf( stderr, "gamescope: received kill signal, terminating!\n" );
+		g_bRun = false;
+		break;
+	default:
+		assert( false ); // unreachable
+	}
 }
 
 int main(int argc, char **argv)
 {
+	int nPreferredOutputWidth = 0;
+	int nPreferredOutputHeight = 0;
+
+	static std::string optstring = build_optstring(gamescope_options);
+	gamescope_optstring = optstring.c_str();
+
 	int o;
-	ac = argc;
-	av = argv;
-
-	bool bSleepAtStartup = false;
-
-	while ((o = getopt(argc, argv, GAMESCOPE_OPTIONS)) != -1)
+	int opt_index = -1;
+	while ((o = getopt_long(argc, argv, gamescope_optstring, gamescope_options, &opt_index)) != -1)
 	{
+		const char *opt_name;
 		switch (o) {
 			case 'w':
 				g_nNestedWidth = atoi( optarg );
@@ -67,26 +196,23 @@ int main(int argc, char **argv)
 			case 'h':
 				g_nNestedHeight = atoi( optarg );
 				break;
-			case 'W':
-				g_nOutputWidth = atoi( optarg );
-				break;
-			case 'H':
-				g_nOutputHeight = atoi( optarg );
-				break;
 			case 'r':
 				g_nNestedRefresh = atoi( optarg );
+				break;
+			case 'W':
+				nPreferredOutputWidth = atoi( optarg );
+				break;
+			case 'H':
+				nPreferredOutputHeight = atoi( optarg );
 				break;
 			case 'o':
 				g_nNestedUnfocusedRefresh = atoi( optarg );
 				break;
-			case 's':
-				bSleepAtStartup = true;
+			case 'm':
+				g_flMaxWindowScale = atof( optarg );
 				break;
-			case 'L':
-				g_bUseLayers = false;
-				break;
-			case 'd':
-				g_bDebugLayers = true;
+			case 'i':
+				g_bIntegerScale = true;
 				break;
 			case 'n':
 				g_bFilterGameWindow = false;
@@ -100,29 +226,27 @@ int main(int argc, char **argv)
 			case 'O':
 				g_sOutputName = optarg;
 				break;
-			default:
+			case 0: // long options without a short option
+				opt_name = gamescope_options[opt_index].name;
+				if (strcmp(opt_name, "help") == 0) {
+					fprintf(stderr, "%s", usage);
+					return 0;
+				} else if (strcmp(opt_name, "disable-layers") == 0) {
+					g_bUseLayers = false;
+				} else if (strcmp(opt_name, "debug-layers") == 0) {
+					g_bDebugLayers = true;
+				}
 				break;
+			case '?':
+				fprintf( stderr, "See --help for a list of options.\n" );
+				return 1;
 		}
 	}
 
-	if ( g_nOutputHeight == 0 )
-	{
-		if ( g_nOutputWidth != 0 )
-		{
-			fprintf( stderr, "Cannot specify -W without -H\n" );
-			return 1;
-		}
-		g_nOutputHeight = 720;
-	}
-	if ( g_nOutputWidth == 0 )
-		g_nOutputWidth = g_nOutputHeight * 16 / 9;
-
-	cap_t caps;
-	caps = cap_get_proc();
-	cap_flag_value_t nicecapvalue = CAP_CLEAR;
-
+	cap_t caps = cap_get_proc();
 	if ( caps != nullptr )
 	{
+		cap_flag_value_t nicecapvalue = CAP_CLEAR;
 		cap_get_flag( caps, CAP_SYS_NICE, CAP_EFFECTIVE, &nicecapvalue );
 
 		if ( nicecapvalue == CAP_SET )
@@ -155,11 +279,6 @@ int main(int argc, char **argv)
 		fprintf( stderr, "Tracing is enabled\n");
 	}
 
-	if ( bSleepAtStartup == true )
-	{
-	 	sleep( 2 );
-	}
-
 	XInitThreads();
 	g_mainThread = pthread_self();
 
@@ -168,21 +287,42 @@ int main(int argc, char **argv)
 		g_bIsNested = true;
 	}
 
-	if ( wlsession_init() != 0 )
+	if ( !wlsession_init() )
 	{
 		fprintf( stderr, "Failed to initialize Wayland session\n" );
 		return 1;
 	}
 
-	if ( initOutput() != 0 )
+	if ( BIsNested() )
+	{
+		if ( SDL_Init( SDL_INIT_VIDEO | SDL_INIT_EVENTS ) != 0 )
+		{
+			fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+			return 1;
+		}
+	}
+
+	if ( !vulkan_init() )
+	{
+		fprintf( stderr, "Failed to initialize Vulkan\n" );
+		return 1;
+	}
+
+	if ( !initOutput( nPreferredOutputWidth, nPreferredOutputHeight, g_nNestedRefresh ) )
 	{
 		fprintf( stderr, "Failed to initialize output\n" );
 		return 1;
 	}
 
-	if ( vulkan_init() != True )
+	if ( !vulkan_init_formats() )
 	{
-		fprintf( stderr, "Failed to initialize Vulkan\n" );
+		fprintf( stderr, "vulkan_init_formats failed\n" );
+		return 1;
+	}
+
+	if ( !vulkan_make_output() )
+	{
+		fprintf( stderr, "vulkan_make_output failed\n" );
 		return 1;
 	}
 
@@ -220,7 +360,7 @@ int main(int argc, char **argv)
 	if ( g_nNestedWidth == 0 )
 		g_nNestedWidth = g_nNestedHeight * 16 / 9;
 
-	if ( wlserver_init(argc, argv, g_bIsNested == true ) != 0 )
+	if ( !wlserver_init() )
 	{
 		fprintf( stderr, "Failed to initialize wlserver\n" );
 		return 1;
@@ -229,33 +369,58 @@ int main(int argc, char **argv)
 	setenv("DISPLAY", wlserver_get_nested_display_name(), 1);
 	setenv("GAMESCOPE_WAYLAND_DISPLAY", wlserver_get_wl_display_name(), 1);
 
-	startSteamCompMgr();
+#if HAVE_PIPEWIRE
+	if ( !init_pipewire() )
+	{
+		fprintf( stderr, "Warning: failed to setup PipeWire, screen capture won't be available\n" );
+	}
+#endif
+
+	std::thread steamCompMgrThread( steamCompMgrThreadRun, argc, argv );
+
+	signal( SIGTERM, handle_signal );
+	signal( SIGINT, handle_signal );
+	signal( SIGUSR2, handle_signal );
 
 	wlserver_run();
+
+	steamCompMgrThread.join();
 }
 
-void steamCompMgrThreadRun(void)
+static void steamCompMgrThreadRun(int argc, char **argv)
 {
-	steamcompmgr_main( ac, av );
+	steamcompmgr_main( argc, argv );
 
 	pthread_kill( g_mainThread, SIGINT );
 }
 
-void startSteamCompMgr(void)
-{
-	std::thread steamCompMgrThread( steamCompMgrThreadRun );
-	steamCompMgrThread.detach();
-}
-
-int initOutput(void)
+static bool initOutput( int preferredWidth, int preferredHeight, int preferredRefresh )
 {
 	if ( g_bIsNested == true )
 	{
-		return sdlwindow_init() == false;
+		g_nOutputWidth = preferredWidth;
+		g_nOutputHeight = preferredHeight;
+		g_nOutputRefresh = preferredRefresh;
+
+		if ( g_nOutputHeight == 0 )
+		{
+			if ( g_nOutputWidth != 0 )
+			{
+				fprintf( stderr, "Cannot specify -W without -H\n" );
+				return 1;
+			}
+			g_nOutputHeight = 720;
+		}
+		if ( g_nOutputWidth == 0 )
+			g_nOutputWidth = g_nOutputHeight * 16 / 9;
+		if ( g_nOutputRefresh == 0 )
+			g_nOutputRefresh = 60;
+
+		return sdlwindow_init();
 	}
 	else
 	{
-		return init_drm( &g_DRM, nullptr );
+		return init_drm( &g_DRM, preferredWidth, preferredHeight, preferredRefresh );
 	}
 }
 
@@ -263,13 +428,13 @@ void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf)
 {
 	{
 		std::lock_guard<std::mutex> lock( wayland_commit_lock );
-		
+
 		ResListEntry_t newEntry = {
 			.surf = surf,
 			.buf = buf,
 		};
 		wayland_commit_queue.push_back( newEntry );
 	}
-	
+
 	nudge_steamcompmgr();
 }

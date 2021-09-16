@@ -16,7 +16,6 @@ struct wlserver_t {
 	struct {
 		struct wlr_backend *multi_backend;
 		struct wlr_backend *noop_backend;
-		struct wlr_backend *headless_backend;
 		struct wlr_backend *libinput_backend;
 
 		struct wlr_renderer *renderer;
@@ -25,6 +24,9 @@ struct wlserver_t {
 		struct wlr_session *session;	
 		struct wlr_seat *seat;
 		struct wlr_output *output;
+
+		// Used to simulate key events when nested
+		struct wlr_input_device *virtual_keyboard_device;
 	} wlr;
 	
 	struct wlr_surface *mouse_focus_surface;
@@ -49,6 +51,8 @@ struct wlserver_pointer {
 	
 	struct wl_listener motion;
 	struct wl_listener button;
+	struct wl_listener axis;
+	struct wl_listener frame;
 };
 
 struct wlserver_touch {
@@ -58,8 +62,6 @@ struct wlserver_touch {
 	struct wl_listener up;
 	struct wl_listener motion;
 };
-
-extern bool run;
 
 enum wlserver_touch_click_mode {
 	WLSERVER_TOUCH_CLICK_HOVER = 0,
@@ -73,12 +75,12 @@ extern enum wlserver_touch_click_mode g_nTouchClickMode;
 
 void xwayland_surface_role_commit(struct wlr_surface *wlr_surface);
 
-int wlsession_init( void );
+bool wlsession_init( void );
 int wlsession_open_kms( const char *device_name );
 
-int wlserver_init( int argc, char **argv, bool bIsNested );
+bool wlserver_init( void );
 
-int wlserver_run(void);
+void wlserver_run(void);
 
 void wlserver_lock(void);
 void wlserver_unlock(void);
@@ -86,7 +88,7 @@ void wlserver_unlock(void);
 void wlserver_keyboardfocus( struct wlr_surface *surface );
 void wlserver_key( uint32_t key, bool press, uint32_t time );
 
-void wlserver_mousefocus( struct wlr_surface *wlrsurface );
+void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x = 0, int y = 0 );
 void wlserver_mousemotion( int x, int y, uint32_t time );
 void wlserver_mousebutton( int button, bool press, uint32_t time );
 void wlserver_mousewheel( int x, int y, uint32_t time );

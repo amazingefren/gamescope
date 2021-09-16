@@ -49,6 +49,11 @@ public:
 			   struct VulkanPipeline_t *pPipeline);
 	void setDirty();
 
+	// Will take ownership of data.
+	bool setCursorImage(char *data, int w, int h);
+
+	void hide() { m_lastMovedTime = 0; checkSuspension(); }
+
 private:
 	void warp(int x, int y);
 	void checkSuspension();
@@ -89,3 +94,4 @@ extern float focusedWindowOffsetX;
 extern float focusedWindowOffsetY;
 
 void nudge_steamcompmgr( void );
+void take_screenshot( void );

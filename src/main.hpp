@@ -1,14 +1,15 @@
 #pragma once
 
-#define GAMESCOPE_OPTIONS ":R:T:C:w:h:W:H:r:o:NFSvVecsdLnbfxO:"
+#include <getopt.h>
 
-int initOutput(void);
+#include <atomic>
 
-void startSteamCompMgr(void);
-
-void register_signal(void);
+extern const char *gamescope_optstring;
+extern const struct option *gamescope_options;
 
 void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf);
+
+extern std::atomic< bool > g_bRun;
 
 extern int g_nNestedWidth;
 extern int g_nNestedHeight;
@@ -25,10 +26,8 @@ extern bool g_bFilterGameWindow;
 
 extern bool g_bBorderlessOutputWindow;
 
-extern bool g_bTakeScreenshot;
-
 extern bool g_bNiceCap;
 extern int g_nOldNice;
 extern int g_nNewNice;
 
-int BIsNested( void );
+bool BIsNested( void );

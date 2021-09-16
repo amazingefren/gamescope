@@ -45,6 +45,7 @@ struct connector {
 	uint32_t id;
 	char *name;
 	drmModeConnector *connector;
+	uint32_t possible_crtcs;
 	std::map<std::string, const drmModePropertyRes *> props;
 	std::map<std::string, uint64_t> initial_prop_values;
 };
@@ -61,6 +62,8 @@ struct fb {
 
 struct drm_t {
 	int fd;
+
+	int preferred_width, preferred_height, preferred_refresh;
 
 	uint64_t cursor_width, cursor_height;
 	bool allow_modifiers;
@@ -110,6 +113,8 @@ struct drm_t {
 	std::atomic < bool > paused;
 	std::atomic < bool > out_of_date;
 	std::atomic < bool > needs_modeset;
+
+	std::unordered_map< std::string, int > connector_priorities;
 };
 
 extern struct drm_t g_DRM;
@@ -121,12 +126,16 @@ extern bool g_bRotated;
 extern bool g_bDebugLayers;
 extern const char *g_sOutputName;
 
-int init_drm(struct drm_t *drm, const char *device);
+bool init_drm(struct drm_t *drm, int width, int height, int refresh);
+void finish_drm(struct drm_t *drm);
 int drm_commit(struct drm_t *drm, struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline );
 int drm_prepare( struct drm_t *drm, const struct Composite_t *pComposite, const struct VulkanPipeline_t *pPipeline );
+bool drm_poll_state(struct drm_t *drm);
 uint32_t drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_buffer *buf, struct wlr_dmabuf_attributes *dma_buf );
 void drm_drop_fbid( struct drm_t *drm, uint32_t fbid );
 bool drm_set_connector( struct drm_t *drm, struct connector *conn );
 bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode );
 bool drm_set_refresh( struct drm_t *drm, int refresh );
 bool drm_set_resolution( struct drm_t *drm, int width, int height );
+
+char *find_drm_node_by_devid(dev_t devid);
