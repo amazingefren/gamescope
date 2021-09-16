@@ -54,7 +54,7 @@ void updateOutputRefresh( void )
 {
 	int display_index = 0;
 	SDL_DisplayMode mode = { SDL_PIXELFORMAT_UNKNOWN, 0, 0, 0, 0 };
-	
+
 	display_index = SDL_GetWindowDisplayIndex( g_SDLWindow );
 	if ( SDL_GetDesktopDisplayMode( display_index, &mode ) == 0 )
 	{
@@ -65,15 +65,7 @@ void updateOutputRefresh( void )
 void inputSDLThreadRun( void )
 {
 	SDL_Event event;
-	SDL_Keymod mod;
 	uint32_t key;
-
-	if ( SDL_Init( SDL_INIT_VIDEO | SDL_INIT_EVENTS ) != 0 )
-	{
-		fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-		g_SDLInitLock.unlock();
-		return;
-	}
 
 	g_unSDLUserEventID = SDL_RegisterEvents( 1 );
 
@@ -106,20 +98,13 @@ void inputSDLThreadRun( void )
 		return;
 	}
 
-	unsigned int extCount = 0;
-	SDL_Vulkan_GetInstanceExtensions( g_SDLWindow, &extCount, nullptr );
-
-	g_vecSDLInstanceExts.resize( extCount );
-
-	SDL_Vulkan_GetInstanceExtensions( g_SDLWindow, &extCount, g_vecSDLInstanceExts.data() );
-
 	SDL_SetRelativeMouseMode(SDL_TRUE);
 
 	g_nOldNestedRefresh = g_nNestedRefresh;
-	
+
 	g_bSDLInitOK = true;
 	g_SDLInitLock.unlock();
-	
+
 	while( SDL_WaitEvent( &event ) )
 	{
 		switch( event.type )
@@ -144,10 +129,9 @@ void inputSDLThreadRun( void )
 				break;
 			case SDL_KEYDOWN:
 			case SDL_KEYUP:
-				mod = SDL_GetModState();
 				key = SDLScancodeToLinuxKey( event.key.keysym.scancode );
 
-				if ( event.type == SDL_KEYUP && mod & KMOD_LGUI )
+				if ( event.type == SDL_KEYUP && ( event.key.keysym.mod & KMOD_LGUI ) )
 				{
 					bool handled = true;
 					switch ( key )
@@ -160,7 +144,7 @@ void inputSDLThreadRun( void )
 							g_bFilterGameWindow = !g_bFilterGameWindow;
 							break;
 						case KEY_S:
-							g_bTakeScreenshot = true;
+							take_screenshot();
 							break;
 						default:
 							handled = false;
@@ -170,6 +154,10 @@ void inputSDLThreadRun( void )
 						break;
 					}
 				}
+
+				// On Wayland, clients handle key repetition
+				if ( event.key.repeat )
+					break;
 
 				wlserver_lock();
 				wlserver_key( key, event.type == SDL_KEYDOWN, event.key.timestamp );
@@ -187,9 +175,9 @@ void inputSDLThreadRun( void )
 					case SDL_WINDOWEVENT_SIZE_CHANGED:
 						g_nOutputWidth = event.window.data1;
 						g_nOutputHeight = event.window.data2;
-						
+
 						updateOutputRefresh();
-						
+
 						break;
 					case SDL_WINDOWEVENT_FOCUS_LOST:
 						g_nNestedRefresh = g_nNestedUnfocusedRefresh;
@@ -217,7 +205,7 @@ bool sdlwindow_init( void )
 
 	std::thread inputSDLThread( inputSDLThreadRun );
 	inputSDLThread.detach();
-	
+
 	// When this returns SDL_Init should be over
 	g_SDLInitLock.lock();
 

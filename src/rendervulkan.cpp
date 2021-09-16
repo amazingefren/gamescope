@@ -1,5 +1,6 @@
 // Initialize Vulkan and composite stuff with a compute queue
 
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #include "main.hpp"
 #include "steamcompmgr.hpp"
 #include "sdlwindow.hpp"
+#include "log.hpp"
 
 #include "composite.h"
 
@@ -25,8 +27,6 @@ const VkApplicationInfo appInfo = {
 	.engineVersion = VK_MAKE_VERSION(1, 0, 0),
 	.apiVersion = VK_API_VERSION_1_1,
 };
-
-std::vector< const char * > g_vecSDLInstanceExts;
 
 VkInstance instance;
 
@@ -53,10 +53,6 @@ struct VulkanOutput_t
 
 	int nCurCmdBuffer;
 	VkCommandBuffer commandBuffers[2]; // ping/pong command buffers as well
-	
-	VkBuffer constantBuffer;
-	VkDeviceMemory bufferMemory;
-	Composite_t::CompositeData_t *pCompositeBuffer;
 
 	VkFence fence;
 	int fenceFD;
@@ -74,6 +70,11 @@ VkCommandPool commandPool;
 VkDescriptorPool descriptorPool;
 
 bool g_vulkanSupportsModifiers;
+
+bool g_vulkanHasDrmPrimaryDevId = false;
+dev_t g_vulkanDrmPrimaryDevId = 0;
+
+static int g_drmRenderFd = -1;
 
 VkDescriptorSetLayout descriptorSetLayout;
 VkPipelineLayout pipelineLayout;
@@ -111,6 +112,7 @@ struct VulkanSamplerCacheEntry_t
 {
 	VulkanPipeline_t::LayerBinding_t key;
 	VkSampler sampler;
+	bool bForceNearest;
 };
 
 std::vector< VulkanSamplerCacheEntry_t > g_vecVulkanSamplerCache;
@@ -118,7 +120,20 @@ std::vector< VulkanSamplerCacheEntry_t > g_vecVulkanSamplerCache;
 VulkanTexture_t g_emptyTex;
 
 static std::map< VkFormat, std::map< uint64_t, VkDrmFormatModifierPropertiesEXT > > DRMModifierProps = {};
+static std::vector< uint32_t > sampledShmFormats{};
 static struct wlr_drm_format_set sampledDRMFormats = {};
+
+static LogScope vk_log("vulkan");
+
+static void vk_errorf(VkResult result, const char *fmt, ...) {
+	static char buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	vk_log.errorf("%s (VkResult: %d)", buf, result);
+}
 
 #define MAX_DEVICE_COUNT 8
 #define MAX_QUEUE_COUNT 8
@@ -231,7 +246,7 @@ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
 	struct stat first_stat;
 	if ( fstat( pDMA->fd[0], &first_stat ) != 0 )
 	{
-		perror( "fstat failed" );
+		vk_log.errorf_errno( "fstat failed" );
 		return false;
 	}
 
@@ -240,7 +255,7 @@ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
 		struct stat plane_stat;
 		if ( fstat( pDMA->fd[i], &plane_stat ) != 0 )
 		{
-			perror( "fstat failed" );
+			vk_log.errorf_errno( "fstat failed" );
 			return false;
 		}
 		if ( plane_stat.st_ino != first_stat.st_ino )
@@ -339,7 +354,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 		externalImageProperties.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
 		res = getModifierProps( &imageInfo, pDMA->modifier, &externalImageProperties );
 		if ( res != VK_SUCCESS && res != VK_ERROR_FORMAT_NOT_SUPPORTED ) {
-			fprintf( stderr, "getModifierProps failed\n" );
+			vk_errorf( res, "getModifierProps failed" );
 			return false;
 		}
 
@@ -397,7 +412,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 			if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED )
 				continue;
 			else if ( res != VK_SUCCESS ) {
-				fprintf( stderr, "getModifierProps failed\n" );
+				vk_errorf( res, "getModifierProps failed" );
 				return false;
 			}
 
@@ -440,8 +455,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 	
 	m_format = imageInfo.format;
 
-	if (vkCreateImage(device, &imageInfo, nullptr, &m_vkImage) != VK_SUCCESS) {
-		fprintf( stderr, "vkCreateImage failed\n" );
+	res = vkCreateImage(device, &imageInfo, nullptr, &m_vkImage);
+	if (res != VK_SUCCESS) {
+		vk_errorf( res, "vkCreateImage failed" );
 		return false;
 	}
 	
@@ -489,7 +505,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 		int fd = dup( pDMA->fd[0] );
 		if ( fd < 0 )
 		{
-			perror( "dup failed" );
+			vk_log.errorf_errno( "dup failed" );
 			return false;
 		}
 
@@ -509,13 +525,17 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 		allocInfo.pNext = &importMemoryInfo;
 	}
 	
-	if (vkAllocateMemory(device, &allocInfo, nullptr, &m_vkImageMemory) != VK_SUCCESS) {
+	res = vkAllocateMemory( device, &allocInfo, nullptr, &m_vkImageMemory );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkAllocateMemory failed" );
 		return false;
 	}
 	
-	res = vkBindImageMemory(device, m_vkImage, m_vkImageMemory, 0);
-	if ( res != VK_SUCCESS ) {
-		fprintf( stderr, "vkBindImageMemory failed\n" );
+	res = vkBindImageMemory( device, m_vkImage, m_vkImageMemory, 0 );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkBindImageMemory failed" );
 		return false;
 	}
 
@@ -556,7 +576,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 		};
 		res = dyn_vkGetMemoryFdKHR(device, &memory_get_fd_info, &dmabuf.fd[0]);
 		if ( res != VK_SUCCESS ) {
-			fprintf( stderr, "vkGetMemoryFdKHR failed\n" );
+			vk_errorf( res, "vkGetMemoryFdKHR failed" );
 			return false;
 		}
 
@@ -567,7 +587,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 			imgModifierProps.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
 			res = dyn_vkGetImageDrmFormatModifierPropertiesEXT( device, m_vkImage, &imgModifierProps );
 			if ( res != VK_SUCCESS ) {
-				fprintf( stderr, "vkGetImageDrmFormatModifierPropertiesEXT failed\n" );
+				vk_errorf( res, "vkGetImageDrmFormatModifierPropertiesEXT failed" );
 				return false;
 			}
 			dmabuf.modifier = imgModifierProps.drmFormatModifier;
@@ -603,7 +623,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 			{
 				dmabuf.fd[i] = dup( dmabuf.fd[0] );
 				if ( dmabuf.fd[i] < 0 ) {
-					fprintf( stderr, "dup failed\n" );
+					vk_log.errorf_errno( "dup failed" );
 					return false;
 				}
 			}
@@ -626,7 +646,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 
 		m_FBID = drm_fbid_from_dmabuf( &g_DRM, nullptr, &dmabuf );
 		if ( m_FBID == 0 ) {
-			fprintf( stderr, "drm_fbid_from_dmabuf failed\n" );
+			vk_log.errorf( "drm_fbid_from_dmabuf failed" );
 			return false;
 		}
 
@@ -660,17 +680,16 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, VkFormat format, cr
 	
 	res = vkCreateImageView(device, &createInfo, nullptr, &m_vkImageView);
 	if ( res != VK_SUCCESS ) {
-		fprintf( stderr, "vkCreateImageView failed\n" );
+		vk_errorf( res, "vkCreateImageView failed" );
 		return false;
 	}
 
 	if ( flags.bMappable )
 	{
-		vkMapMemory( device, m_vkImageMemory, 0, VK_WHOLE_SIZE, 0, &m_pMappedData );
-
-		if ( m_pMappedData == nullptr )
+		res = vkMapMemory( device, m_vkImageMemory, 0, VK_WHOLE_SIZE, 0, &m_pMappedData );
+		if ( res != VK_SUCCESS )
 		{
-			fprintf( stderr, "vkMapMemory failed\n" );
+			vk_errorf( res, "vkMapMemory failed" );
 			return false;
 		}
 	}
@@ -717,7 +736,7 @@ CVulkanTexture::~CVulkanTexture( void )
 	m_bInitialized = false;
 }
 
-void init_formats()
+bool vulkan_init_formats()
 {
 	for ( size_t i = 0; s_DRMVKFormatTable[i].DRMFormat != DRM_FORMAT_INVALID; i++ )
 	{
@@ -741,9 +760,11 @@ void init_formats()
 		}
 		else if ( res != VK_SUCCESS )
 		{
-			fprintf( stderr, "vkGetPhysicalDeviceImageFormatProperties2 failed for DRM format 0x%" PRIX32 "\n", drmFormat );
+			vk_errorf( res, "vkGetPhysicalDeviceImageFormatProperties2 failed for DRM format 0x%" PRIX32, drmFormat );
 			continue;
 		}
+
+		sampledShmFormats.push_back( drmFormat );
 
 		if ( !g_vulkanSupportsModifiers )
 		{
@@ -765,7 +786,7 @@ void init_formats()
 
 		if ( modifierPropList.drmFormatModifierCount == 0 )
 		{
-			fprintf( stderr, "vkGetPhysicalDeviceFormatProperties2 returned zero modifiers for DRM format 0x%" PRIX32 "\n", drmFormat );
+			vk_errorf( res, "vkGetPhysicalDeviceFormatProperties2 returned zero modifiers for DRM format 0x%" PRIX32, drmFormat );
 			continue;
 		}
 
@@ -803,13 +824,23 @@ void init_formats()
 		DRMModifierProps[ format ] = map;
 	}
 
-	fprintf( stderr, "Supported DRM formats for sampling usage: " );
+	vk_log.infof( "supported DRM formats for sampling usage:" );
 	for ( size_t i = 0; i < sampledDRMFormats.len; i++ )
 	{
 		uint32_t fmt = sampledDRMFormats.formats[ i ]->format;
-		fprintf( stderr, "%s0x%" PRIX32, i == 0 ? "" : ", ", fmt );
+		vk_log.infof( "  0x%" PRIX32, fmt );
 	}
-	fprintf( stderr, "\n" );
+
+	CVulkanTexture::createFlags texCreateFlags;
+	uint32_t bits = 0;
+	g_emptyTex = vulkan_create_texture_from_bits( 1, 1, VK_FORMAT_R8G8B8A8_UNORM, texCreateFlags, &bits );
+
+	if ( g_emptyTex == 0 )
+	{
+		return false;
+	}
+
+	return true;
 }
 
 static bool is_vulkan_1_1_device(VkPhysicalDevice device)
@@ -820,7 +851,7 @@ static bool is_vulkan_1_1_device(VkPhysicalDevice device)
 	return properties.apiVersion >= VK_API_VERSION_1_1;
 }
 
-int init_device()
+static bool init_device()
 {
 	uint32_t physicalDeviceCount = 0;
 	VkPhysicalDevice deviceHandles[MAX_DEVICE_COUNT];
@@ -874,10 +905,14 @@ retry:
 
 	if (!physicalDevice)
 	{
-		fprintf(stderr, "Failed to find physical device\n");
+		vk_log.errorf("failed to find physical device");
 		return false;
 	}
-	
+
+	VkPhysicalDeviceProperties props = {};
+	vkGetPhysicalDeviceProperties( physicalDevice, &props );
+	vk_log.infof( "selecting physical device '%s'", props.deviceName );
+
 	vkGetPhysicalDeviceMemoryProperties( physicalDevice, &memoryProperties );
 
 	uint32_t supportedExtensionCount;
@@ -887,17 +922,119 @@ retry:
 	vkEnumerateDeviceExtensionProperties( physicalDevice, NULL, &supportedExtensionCount, vecSupportedExtensions.data() );
 
 	g_vulkanSupportsModifiers = false;
+	bool hasDrmProps = false;
+	bool hasPciBusProps = false;
+	bool supportsForeignQueue = false;
 	for ( uint32_t i = 0; i < supportedExtensionCount; ++i )
 	{
 		if ( strcmp(vecSupportedExtensions[i].extensionName,
 		     VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) == 0 )
 			g_vulkanSupportsModifiers = true;
+
+		if ( strcmp(vecSupportedExtensions[i].extensionName,
+		            VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0 )
+			hasDrmProps = true;
+
+		if ( strcmp(vecSupportedExtensions[i].extensionName,
+		            VK_EXT_PCI_BUS_INFO_EXTENSION_NAME) == 0 )
+			hasPciBusProps = true;
+
+		if ( strcmp(vecSupportedExtensions[i].extensionName,
+		     VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0 )
+			supportsForeignQueue = true;
 	}
 
-	fprintf( stderr, "Vulkan %s DRM format modifiers\n",
-			g_vulkanSupportsModifiers ? "supports" : "does not support" );
+	vk_log.infof( "physical device %s DRM format modifiers", g_vulkanSupportsModifiers ? "supports" : "does not support" );
 
-	init_formats();
+	if ( hasDrmProps ) {
+		VkPhysicalDeviceDrmPropertiesEXT drmProps = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
+		};
+		VkPhysicalDeviceProperties2 props2 = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			.pNext = &drmProps,
+		};
+		vkGetPhysicalDeviceProperties2( physicalDevice, &props2 );
+
+		if ( !BIsNested() && !drmProps.hasPrimary ) {
+			vk_log.errorf( "physical device has no primary node" );
+			return false;
+		}
+		if ( !drmProps.hasRender ) {
+			vk_log.errorf( "physical device has no render node" );
+			return false;
+		}
+
+		dev_t renderDevId = makedev( drmProps.renderMajor, drmProps.renderMinor );
+		char *renderName = find_drm_node_by_devid( renderDevId );
+		if ( renderName == nullptr ) {
+			vk_log.errorf( "failed to find DRM node" );
+			return false;
+		}
+
+		g_drmRenderFd = open( renderName, O_RDWR | O_CLOEXEC );
+		if ( g_drmRenderFd < 0 ) {
+			vk_log.errorf_errno( "failed to open DRM render node" );
+			return false;
+		}
+
+		if ( drmProps.hasPrimary ) {
+			g_vulkanHasDrmPrimaryDevId = true;
+			g_vulkanDrmPrimaryDevId = makedev( drmProps.primaryMajor, drmProps.primaryMinor );
+		}
+	} else if ( hasPciBusProps ) {
+		// TODO: drop this logic once VK_EXT_physical_device_drm support is widespread
+
+		VkPhysicalDevicePCIBusInfoPropertiesEXT pciBusProps = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT,
+		};
+		VkPhysicalDeviceProperties2 props2 = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			.pNext = &pciBusProps,
+		};
+		vkGetPhysicalDeviceProperties2( physicalDevice, &props2 );
+
+		drmDevice *drmDevices[32];
+		int drmDevicesLen = drmGetDevices2(0, drmDevices, sizeof(drmDevices) / sizeof(drmDevices[0]));
+		if (drmDevicesLen < 0) {
+			vk_log.errorf_errno("drmGetDevices2 failed");
+			return false;
+		}
+
+		drmDevice *match = nullptr;
+		for ( int i = 0; i < drmDevicesLen; i++ ) {
+			drmDevice *drmDev = drmDevices[ i ];
+			if ( !( drmDev->available_nodes & ( 1 << DRM_NODE_RENDER ) ) )
+				continue;
+			if ( drmDev->bustype != DRM_BUS_PCI )
+				continue;
+
+			if ( pciBusProps.pciDevice == drmDev->businfo.pci->dev && pciBusProps.pciBus == drmDev->businfo.pci->bus && pciBusProps.pciDomain == drmDev->businfo.pci->domain && pciBusProps.pciFunction == drmDev->businfo.pci->func ) {
+				match = drmDev;
+				break;
+			}
+		}
+		if (match == nullptr) {
+			vk_log.errorf("failed to find DRM device from PCI bus info");
+		}
+
+		g_drmRenderFd = open( match->nodes[ DRM_NODE_RENDER ], O_RDWR | O_CLOEXEC );
+		if ( g_drmRenderFd < 0 ) {
+			vk_log.errorf_errno( "failed to open DRM render node" );
+			return false;
+		}
+
+		drmFreeDevices( drmDevices, drmDevicesLen );
+	} else {
+		vk_log.errorf( "physical device doesn't support VK_EXT_physical_device_drm nor VK_EXT_pci_bus_info" );
+		return false;
+	}
+
+	if ( g_vulkanSupportsModifiers && !supportsForeignQueue && !BIsNested() ) {
+		vk_log.infof( "The vulkan driver does not support foreign queues,"
+		              " disabling modifier support.");
+		g_vulkanSupportsModifiers = false;
+	}
 
 	float queuePriorities = 1.0f;
 
@@ -930,6 +1067,10 @@ retry:
 	if ( g_vulkanSupportsModifiers )
 	{
 		vecEnabledDeviceExtensions.push_back( VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME );
+		vecEnabledDeviceExtensions.push_back( VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME ); // Required.
+
+		if ( !BIsNested() )
+			vecEnabledDeviceExtensions.push_back( VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME );
 	}
 
 	vecEnabledDeviceExtensions.push_back( VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME );
@@ -948,27 +1089,29 @@ retry:
 		.pEnabledFeatures = 0,
 	};
 
-	VkResult result = vkCreateDevice(physicalDevice, &deviceCreateInfo, NULL, &device);
-	
-	if ( result != VK_SUCCESS )
+	VkResult res = vkCreateDevice(physicalDevice, &deviceCreateInfo, NULL, &device);
+	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkCreateDevice failed" );
 		return false;
 	}
 	
 	vkGetDeviceQueue(device, queueFamilyIndex, 0, &queue);
-	
 	if ( queue == VK_NULL_HANDLE )
+	{
+		vk_log.errorf( "vkGetDeviceQueue failed" );
 		return false;
+	}
 	
 	VkShaderModuleCreateInfo shaderModuleCreateInfo = {};
 	shaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
 	shaderModuleCreateInfo.codeSize = sizeof(composite_spv);
 	shaderModuleCreateInfo.pCode = (const uint32_t*)composite_spv;
 	
-	VkResult res = vkCreateShaderModule( device, &shaderModuleCreateInfo, nullptr, &shaderModule );
-	
+	res = vkCreateShaderModule( device, &shaderModuleCreateInfo, nullptr, &shaderModule );
 	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkCreateShaderModule failed" );
 		return false;
 	}
 	
@@ -980,19 +1123,15 @@ retry:
 	};
 
 	res = vkCreateCommandPool(device, &commandPoolCreateInfo, 0, &commandPool);
-	
 	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkCreateCommandPool failed" );
 		return false;
 	}
 
 	VkDescriptorPoolSize descriptorPoolSize[] = {
 		{
 			VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-			k_nMaxSets * 1,
-		},
-		{
-			VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			k_nMaxSets * 1,
 		},
 		{
@@ -1011,9 +1150,9 @@ retry:
 	};
 	
 	res = vkCreateDescriptorPool(device, &descriptorPoolCreateInfo, 0, &descriptorPool);
-	
 	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkCreateDescriptorPool failed" );
 		return false;
 	}
 
@@ -1050,15 +1189,9 @@ retry:
 		.pNext = &ycbcrSamplerConversionInfo,
 		.magFilter = VK_FILTER_LINEAR,
 		.minFilter = VK_FILTER_LINEAR,
-		// Using clamp to edge here for now, otherwise we end up with a
-		// 1/2 pixel of green on the left and top of the screen due to
-		// the texel replacement happening before the YCbCr conversion.
-
-		// TODO: Find out why we are even hitting the border in the first place,
-		// maybe there is some weird half-texel stuff somewhere in Gamescope causing this,
-		// I imagine if this was more obvious it would affect games too.
 		.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
 		.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
 		.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
 		.unnormalizedCoordinates = VK_TRUE,
 	};
@@ -1079,18 +1212,12 @@ retry:
 	vecLayoutBindings.push_back( descriptorSetLayoutBindings ); // first binding is target storage image
 	
 	descriptorSetLayoutBindings.binding = 1;
-	descriptorSetLayoutBindings.descriptorCount = 1;
-	descriptorSetLayoutBindings.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-	
-	vecLayoutBindings.push_back( descriptorSetLayoutBindings ); // second binding is composite description buffer
-	
-	descriptorSetLayoutBindings.binding = 2;
 	descriptorSetLayoutBindings.descriptorCount = k_nMaxLayers;
 	descriptorSetLayoutBindings.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 
 	vecLayoutBindings.push_back( descriptorSetLayoutBindings );
 
-	descriptorSetLayoutBindings.binding = 6;
+	descriptorSetLayoutBindings.binding = 5;
 	descriptorSetLayoutBindings.descriptorCount = k_nMaxLayers;
 	descriptorSetLayoutBindings.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	descriptorSetLayoutBindings.pImmutableSamplers = ycbcrSamplers.data();
@@ -1107,11 +1234,17 @@ retry:
 	};
 	
 	res = vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCreateInfo, 0, &descriptorSetLayout);
-	
 	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkCreateDescriptorSetLayout failed" );
 		return false;
 	}
+
+	VkPushConstantRange pushConstantRange = {
+		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+		.offset = 0,
+		.size = sizeof(Composite_t::CompositeData_t)
+	};
 	
 	VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {
 		VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -1119,14 +1252,14 @@ retry:
 		0,
 		1,
 		&descriptorSetLayout,
-		0,
-		0
+		1,
+		&pushConstantRange
 	};
 	
 	res = vkCreatePipelineLayout(device, &pipelineLayoutCreateInfo, 0, &pipelineLayout);
-	
 	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkCreatePipelineLayout failed" );
 		return false;
 	}
 
@@ -1187,8 +1320,10 @@ retry:
 				};
 
 				res = vkCreateComputePipelines(device, 0, 1, &computePipelineCreateInfo, 0, &pipelines[layerCount][swapChannels][ycbcrMask]);
-				if (res != VK_SUCCESS)
+				if (res != VK_SUCCESS) {
+					vk_errorf( res, "vkCreateComputePipelines failed" );
 					return false;
+				}
 			}
 		}
 	}
@@ -1202,9 +1337,9 @@ retry:
 	};
 	
 	res = vkAllocateDescriptorSets(device, &descriptorSetAllocateInfo, &descriptorSet);
-	
 	if ( res != VK_SUCCESS || descriptorSet == VK_NULL_HANDLE )
 	{
+		vk_log.errorf( "vkAllocateDescriptorSets failed" );
 		return false;
 	}
 	
@@ -1216,10 +1351,10 @@ retry:
 	bufferCreateInfo.size = 512 * 512 * 4;
 	bufferCreateInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	
-	result = vkCreateBuffer( device, &bufferCreateInfo, nullptr, &uploadBuffer );
-	
-	if ( result != VK_SUCCESS )
+	res = vkCreateBuffer( device, &bufferCreateInfo, nullptr, &uploadBuffer );
+	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkCreateBuffer failed" );
 		return false;
 	}
 	
@@ -1227,9 +1362,9 @@ retry:
 	vkGetBufferMemoryRequirements(device, uploadBuffer, &memRequirements);
 	
 	int memTypeIndex =  findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
-	
 	if ( memTypeIndex == -1 )
 	{
+		vk_log.errorf( "findMemoryType failed" );
 		return false;
 	}
 	
@@ -1241,10 +1376,11 @@ retry:
 	vkAllocateMemory( device, &allocInfo, nullptr, &uploadBufferMemory);
 	
 	vkBindBufferMemory( device, uploadBuffer, uploadBufferMemory, 0 );
-	vkMapMemory( device, uploadBufferMemory, 0, VK_WHOLE_SIZE, 0, (void**)&pUploadBuffer );
-	
-	if ( pUploadBuffer == nullptr )
+
+	res = vkMapMemory( device, uploadBufferMemory, 0, VK_WHOLE_SIZE, 0, (void**)&pUploadBuffer );
+	if ( res != VK_SUCCESS )
 	{
+		vk_errorf( res, "vkMapMemory failed" );
 		return false;
 	}
 	
@@ -1258,10 +1394,10 @@ retry:
 	
 	for ( uint32_t i = 0; i < k_nScratchCmdBufferCount; i++ )
 	{
-		result = vkAllocateCommandBuffers( device, &commandBufferAllocateInfo, &g_scratchCommandBuffers[ i ].cmdBuf );
-		
-		if ( result != VK_SUCCESS )
+		res = vkAllocateCommandBuffers( device, &commandBufferAllocateInfo, &g_scratchCommandBuffers[ i ].cmdBuf );
+		if ( res != VK_SUCCESS )
 		{
+			vk_errorf( res, "vkAllocateCommandBuffers failed" );
 			return false;
 		}
 		
@@ -1270,16 +1406,15 @@ retry:
 			.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
 		};
 		
-		result = vkCreateFence( device, &fenceCreateInfo, nullptr, &g_scratchCommandBuffers[ i ].fence );
-		
-		if ( result != VK_SUCCESS )
+		res = vkCreateFence( device, &fenceCreateInfo, nullptr, &g_scratchCommandBuffers[ i ].fence );
+		if ( res != VK_SUCCESS )
 		{
+			vk_errorf( res, "vkCreateFence failed" );
 			return false;
 		}
 		
 		g_scratchCommandBuffers[ i ].busy = false;
 	}
-	
 	
 	return true;
 }
@@ -1425,14 +1560,14 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	bool bSuccess = pOutput->outputImage[0].BInit( g_nOutputWidth, g_nOutputHeight, pOutput->outputFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
-		fprintf( stderr, "Failed to allocate buffer for KMS\n" );
+		vk_log.errorf( "failed to allocate buffer for KMS" );
 		return false;
 	}
 
 	bSuccess = pOutput->outputImage[1].BInit( g_nOutputWidth, g_nOutputHeight, pOutput->outputFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
-		fprintf( stderr, "Failed to allocate buffer for KMS\n" );
+		vk_log.errorf( "failed to allocate buffer for KMS" );
 		return false;
 	}
 
@@ -1462,15 +1597,17 @@ bool vulkan_remake_output_images( void )
 	return bRet;
 }
 
-bool vulkan_make_output( VulkanOutput_t *pOutput )
+bool vulkan_make_output( void )
 {
+	VulkanOutput_t *pOutput = &g_output;
+
 	VkResult result;
 	
 	if ( BIsNested() == true )
 	{
 		if ( !SDL_Vulkan_CreateSurface( g_SDLWindow, instance, &pOutput->surface ) )
 		{
-			fprintf( stderr, "SDL_Vulkan_CreateSurface failed\n" );
+			vk_log.errorf( "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError() );
 			return false;
 		}
 
@@ -1479,41 +1616,51 @@ bool vulkan_make_output( VulkanOutput_t *pOutput )
 		vkGetPhysicalDeviceSurfaceSupportKHR( physicalDevice, queueFamilyIndex, pOutput->surface, &canPresent );
 		if ( !canPresent )
 		{
-			fprintf( stderr, "Physical device queue doesn't support presenting on our surface\n" );
+			vk_log.errorf( "physical device queue doesn't support presenting on our surface" );
 			return false;
 		}
 
 		result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physicalDevice, pOutput->surface, &pOutput->surfaceCaps );
-		
 		if ( result != VK_SUCCESS )
+		{
+			vk_errorf( result, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed" );
 			return false;
+		}
 		
 		uint32_t formatCount = 0;
 		result = vkGetPhysicalDeviceSurfaceFormatsKHR( physicalDevice, pOutput->surface, &formatCount, nullptr );
-		
 		if ( result != VK_SUCCESS )
+		{
+			vk_errorf( result, "vkGetPhysicalDeviceSurfaceFormatsKHR failed" );
 			return false;
+		}
 		
 		if ( formatCount != 0 ) {
 			pOutput->surfaceFormats.resize( formatCount );
 			vkGetPhysicalDeviceSurfaceFormatsKHR( physicalDevice, pOutput->surface, &formatCount, pOutput->surfaceFormats.data() );
-			
 			if ( result != VK_SUCCESS )
+			{
+				vk_errorf( result, "vkGetPhysicalDeviceSurfaceFormatsKHR failed" );
 				return false;
+			}
 		}
 		
 		uint32_t presentModeCount = false;
 		result = vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, pOutput->surface, &presentModeCount, nullptr );
-		
 		if ( result != VK_SUCCESS )
+		{
+			vk_errorf( result, "vkGetPhysicalDeviceSurfacePresentModesKHR failed" );
 			return false;
+		}
 		
 		if ( presentModeCount != 0 ) {
 			pOutput->presentModes.resize(presentModeCount);
 			result = vkGetPhysicalDeviceSurfacePresentModesKHR( physicalDevice, pOutput->surface, &presentModeCount, pOutput->presentModes.data() );
-			
 			if ( result != VK_SUCCESS )
+			{
+				vk_errorf( result, "vkGetPhysicalDeviceSurfacePresentModesKHR failed" );
 				return false;
+			}
 		}
 		
 		if ( !vulkan_make_swapchain( pOutput ) )
@@ -1528,7 +1675,7 @@ bool vulkan_make_output( VulkanOutput_t *pOutput )
 		
 		if ( pOutput->outputFormat == VK_FORMAT_UNDEFINED )
 		{
-			fprintf( stderr, "Failed to find Vulkan format suitable for KMS\n" );
+			vk_log.errorf( "failed to find Vulkan format suitable for KMS" );
 			return false;
 		}
 
@@ -1536,46 +1683,6 @@ bool vulkan_make_output( VulkanOutput_t *pOutput )
 			return false;
 	}
 
-	// Make and map constant buffer
-	
-	VkBufferCreateInfo bufferCreateInfo = {};
-	bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	bufferCreateInfo.pNext = nullptr;
-	bufferCreateInfo.size = sizeof( Composite_t::CompositeData_t );
-	bufferCreateInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-	
-	result = vkCreateBuffer( device, &bufferCreateInfo, nullptr, &pOutput->constantBuffer );
-	
-	if ( result != VK_SUCCESS )
-	{
-		return false;
-	}
-	
-	VkMemoryRequirements memRequirements;
-	vkGetBufferMemoryRequirements(device, pOutput->constantBuffer, &memRequirements);
-	
-	int memTypeIndex =  findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
-	
-	if ( memTypeIndex == -1 )
-	{
-		return false;
-	}
-	
-	VkMemoryAllocateInfo allocInfo = {};
-	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	allocInfo.allocationSize = memRequirements.size;
-	allocInfo.memoryTypeIndex = memTypeIndex;
-	
-	vkAllocateMemory( device, &allocInfo, nullptr, &pOutput->bufferMemory );
-	
-	vkBindBufferMemory( device, pOutput->constantBuffer, pOutput->bufferMemory, 0 );
-	vkMapMemory( device, pOutput->bufferMemory, 0, VK_WHOLE_SIZE, 0, (void**)&pOutput->pCompositeBuffer );
-	
-	if ( pOutput->pCompositeBuffer == nullptr )
-	{
-		return false;
-	}
-	
 	// Make command buffers
 	
 	VkCommandBufferAllocateInfo commandBufferAllocateInfo = {
@@ -1587,9 +1694,9 @@ bool vulkan_make_output( VulkanOutput_t *pOutput )
 	};
 	
 	result = vkAllocateCommandBuffers(device, &commandBufferAllocateInfo, pOutput->commandBuffers);
-	
 	if ( result != VK_SUCCESS )
 	{
+		vk_errorf( result, "vkAllocateCommandBuffers failed" );
 		return false;
 	}
 	
@@ -1598,38 +1705,28 @@ bool vulkan_make_output( VulkanOutput_t *pOutput )
 	pOutput->fence = VK_NULL_HANDLE;
 	pOutput->fenceFD = -1;
 	
-	// Write the constant buffer itno descriptor set
-	VkDescriptorBufferInfo bufferInfo = {
-		.buffer = g_output.constantBuffer,
-		.offset = 0,
-		.range = VK_WHOLE_SIZE
-	};
-	
-	VkWriteDescriptorSet writeDescriptorSet = {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.pNext = nullptr,
-		.dstSet = descriptorSet,
-		.dstBinding = 1,
-		.dstArrayElement = 0,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.pImageInfo = nullptr,
-		.pBufferInfo = &bufferInfo,
-		.pTexelBufferView = nullptr,
-	};
-	
-	vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
-	
 	return true;
 }
 
-int vulkan_init(void)
+bool vulkan_init( void )
 {
 	VkResult result = VK_ERROR_INITIALIZATION_FAILED;
-	
+
 	std::vector< const char * > vecEnabledInstanceExtensions;
-	vecEnabledInstanceExtensions.insert( vecEnabledInstanceExtensions.end(), g_vecSDLInstanceExts.begin(), g_vecSDLInstanceExts.end() );
-	
+	if ( BIsNested() )
+	{
+		if ( SDL_Vulkan_LoadLibrary( nullptr ) != 0 )
+		{
+			fprintf(stderr, "SDL_Vulkan_LoadLibrary failed: %s\n", SDL_GetError());
+			return false;
+		}
+
+		unsigned int extCount = 0;
+		SDL_Vulkan_GetInstanceExtensions( nullptr, &extCount, nullptr );
+		vecEnabledInstanceExtensions.resize( extCount );
+		SDL_Vulkan_GetInstanceExtensions( nullptr, &extCount, vecEnabledInstanceExtensions.data() );
+	}
+
 	const VkInstanceCreateInfo createInfo = {
 		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
 		.pApplicationInfo = &appInfo,
@@ -1638,40 +1735,26 @@ int vulkan_init(void)
 	};
 
 	result = vkCreateInstance(&createInfo, 0, &instance);
-	
 	if ( result != VK_SUCCESS )
-		return 0;
-	
-	if ( init_device() != 1 )
 	{
-		return 0;
+		vk_errorf( result, "vkCreateInstance failed" );
+		return false;
 	}
+	
+	if ( !init_device() )
+		return false;
 	
 	dyn_vkGetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr( device, "vkGetMemoryFdKHR" );
 	if ( dyn_vkGetMemoryFdKHR == nullptr )
-		return 0;
+		return false;
 	
 	dyn_vkGetFenceFdKHR = (PFN_vkGetFenceFdKHR)vkGetDeviceProcAddr( device, "vkGetFenceFdKHR" );
 	if ( dyn_vkGetFenceFdKHR == nullptr )
-		return 0;
+		return false;
 
 	dyn_vkGetImageDrmFormatModifierPropertiesEXT = (PFN_vkGetImageDrmFormatModifierPropertiesEXT)vkGetDeviceProcAddr( device, "vkGetImageDrmFormatModifierPropertiesEXT" );
 	
-	if ( vulkan_make_output( &g_output ) == false )
-	{
-		fprintf( stderr, "vulkan_make_output failed\n" );
-		return 0;
-	}
-
-	uint32_t bits = 0;
-	g_emptyTex = vulkan_create_texture_from_bits( 1, 1, VK_FORMAT_R8G8B8A8_UNORM, &bits );
-
-	if ( g_emptyTex == 0 )
-	{
-		return 0;
-	}
-	
-	return 1;
+	return true;
 }
 
 static inline uint32_t get_command_buffer( VkCommandBuffer &cmdBuf, VkFence *pFence )
@@ -1801,18 +1884,15 @@ VulkanTexture_t vulkan_create_texture_from_dmabuf( struct wlr_dmabuf_attributes 
 	return ret;
 }
 
-VulkanTexture_t vulkan_create_texture_from_bits( uint32_t width, uint32_t height, VkFormat format, void *bits )
+VulkanTexture_t vulkan_create_texture_from_bits( uint32_t width, uint32_t height, VkFormat format, CVulkanTexture::createFlags texCreateFlags, void *bits )
 {
 	VulkanTexture_t ret = 0;
 	
 	CVulkanTexture *pTex = new CVulkanTexture();
 
-	CVulkanTexture::createFlags texCreateFlags;
-	texCreateFlags.bFlippable = BIsNested() == false;
-	texCreateFlags.bLinear = true; // cursor buffer needs to be linear
 	texCreateFlags.bTextureable = true;
 	texCreateFlags.bTransferDst = true;
-	
+
 	if ( pTex->BInit( width, height, format, texCreateFlags ) == false )
 	{
 		delete pTex;
@@ -1876,24 +1956,22 @@ bool operator==(const struct VulkanPipeline_t::LayerBinding_t& lhs, struct Vulka
 	if ( lhs.bFilter != rhs.bFilter )
 		return false;
 
-	if ( lhs.bBlackBorder != rhs.bBlackBorder )
-		return false;
-
 	return true;
 }
 
-VkSampler vulkan_make_sampler( struct VulkanPipeline_t::LayerBinding_t *pBinding )
+VkSampler vulkan_make_sampler( struct VulkanPipeline_t::LayerBinding_t *pBinding, bool bForceNearest )
 {
 	VkSampler ret = VK_NULL_HANDLE;
 
 	VkSamplerCreateInfo samplerCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
 		.pNext = nullptr,
-		.magFilter = pBinding->bFilter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-		.minFilter = pBinding->bFilter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-		.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
-		.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
-		.borderColor = pBinding->bBlackBorder ? VK_BORDER_COLOR_INT_OPAQUE_BLACK : VK_BORDER_COLOR_INT_TRANSPARENT_BLACK,
+		.magFilter = (pBinding->bFilter && !bForceNearest) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+		.minFilter = (pBinding->bFilter && !bForceNearest) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+		.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.borderColor = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK,
 		.unnormalizedCoordinates = VK_TRUE,
 	};
 	
@@ -1902,7 +1980,12 @@ VkSampler vulkan_make_sampler( struct VulkanPipeline_t::LayerBinding_t *pBinding
 	return ret;
 }
 
-void vulkan_update_descriptor( struct VulkanPipeline_t *pPipeline, int nYCBCRMask )
+bool float_is_integer(float x)
+{
+	return fabsf(ceilf(x) - x) <= 0.0001f;
+}
+
+void vulkan_update_descriptor( struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline, int nYCBCRMask )
 {
 	{
 		VkImageView targetImageView;
@@ -1942,6 +2025,10 @@ void vulkan_update_descriptor( struct VulkanPipeline_t *pPipeline, int nYCBCRMas
 	{
 		VkSampler sampler = VK_NULL_HANDLE;
 		CVulkanTexture *pTex = nullptr;
+		bool bForceNearest = pComposite->data.vScale[i].x == 1.0f &&
+							 pComposite->data.vScale[i].y == 1.0f &&
+							 float_is_integer(pComposite->data.vOffset[i].x);
+							 float_is_integer(pComposite->data.vOffset[i].y);
 
 		if ( pPipeline->layerBindings[ i ].tex != 0 )
 		{
@@ -1950,15 +2037,13 @@ void vulkan_update_descriptor( struct VulkanPipeline_t *pPipeline, int nYCBCRMas
 		else
 		{
 			pTex = g_mapVulkanTextures[ g_emptyTex ];
-
-			// Switch the border to transparent black
-			pPipeline->layerBindings[ i ].bBlackBorder = false;
 		}
 		
 		// First try to look up the sampler in the cache.
 		for ( uint32_t j = 0; j < g_vecVulkanSamplerCache.size(); j++ )
 		{
-			if ( g_vecVulkanSamplerCache[ j ].key == pPipeline->layerBindings[ i ] )
+			if ( g_vecVulkanSamplerCache[ j ].key == pPipeline->layerBindings[ i ] &&
+				 g_vecVulkanSamplerCache[ j ].bForceNearest == bForceNearest )
 			{
 				sampler = g_vecVulkanSamplerCache[ j ].sampler;
 				break;
@@ -1967,11 +2052,11 @@ void vulkan_update_descriptor( struct VulkanPipeline_t *pPipeline, int nYCBCRMas
 		
 		if ( sampler == VK_NULL_HANDLE )
 		{
-			sampler = vulkan_make_sampler( &pPipeline->layerBindings[ i ] );
+			sampler = vulkan_make_sampler( &pPipeline->layerBindings[ i ], bForceNearest );
 			
 			assert( sampler != VK_NULL_HANDLE );
 			
-			VulkanSamplerCacheEntry_t entry = { pPipeline->layerBindings[ i ], sampler };
+			VulkanSamplerCacheEntry_t entry = { pPipeline->layerBindings[ i ], sampler, bForceNearest };
 			g_vecVulkanSamplerCache.push_back( entry );
 		}
 
@@ -1992,7 +2077,7 @@ void vulkan_update_descriptor( struct VulkanPipeline_t *pPipeline, int nYCBCRMas
 		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 		.pNext = nullptr,
 		.dstSet = descriptorSet,
-		.dstBinding = 2,
+		.dstBinding = 1,
 		.dstArrayElement = 0,
 		.descriptorCount = imageDescriptors.size(),
 		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -2016,7 +2101,7 @@ void vulkan_update_descriptor( struct VulkanPipeline_t *pPipeline, int nYCBCRMas
 			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 			.pNext = nullptr,
 			.dstSet = descriptorSet,
-			.dstBinding = 6,
+			.dstBinding = 5,
 			.dstArrayElement = 0,
 			.descriptorCount = ycbcrImageDescriptors.size(),
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -2033,7 +2118,7 @@ void vulkan_update_descriptor( struct VulkanPipeline_t *pPipeline, int nYCBCRMas
 	}
 }
 
-bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline, bool bScreenshot )
+bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline, CVulkanTexture **pScreenshotTexture )
 {
 	VkImage compositeImage;
 
@@ -2062,21 +2147,16 @@ bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *
 		}
 	}
 
-	// Sample a bit closer to texel centers in most cases
-	// TODO: probably actually need to apply a general scale/bias to properly
-	// sample from the center in all four corners in all scaling scenarios
+	vulkan_update_descriptor( pComposite, pPipeline, pComposite->nYCBCRMask );
+
 	for ( int i = 0; i < pComposite->nLayerCount; i++ )
 	{
-		pComposite->data.vOffset[ i ].x += 0.5f;
-		pComposite->data.vOffset[ i ].y += 0.5f;
+		pComposite->data.vOffset[ i ].x += pComposite->data.vScale[ i ].x / 2.0f;
+		pComposite->data.vOffset[ i ].y += pComposite->data.vScale[ i ].y / 2.0f;
 	}
 
-	*g_output.pCompositeBuffer = pComposite->data;
-	// XXX maybe flush something?
 	
 	assert ( g_output.fence == VK_NULL_HANDLE );
-	
-	vulkan_update_descriptor( pPipeline, pComposite->nYCBCRMask );
 	
 	VkCommandBuffer curCommandBuffer = g_output.commandBuffers[ g_output.nCurCmdBuffer ];
 	
@@ -2105,6 +2185,8 @@ bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *
 	
 	vkCmdBindDescriptorSets(curCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
 							pipelineLayout, 0, 1, &descriptorSet, 0, 0);
+
+	vkCmdPushConstants(curCommandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pComposite->data), &pComposite->data);
 	
 	uint32_t nGroupCountX = currentOutputWidth % 8 ? currentOutputWidth / 8 + 1: currentOutputWidth / 8;
 	uint32_t nGroupCountY = currentOutputHeight % 8 ? currentOutputHeight / 8 + 1: currentOutputHeight / 8;
@@ -2119,23 +2201,7 @@ bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *
 		.layerCount = 1
 	};
 
-	VkImageMemoryBarrier memoryBarrier =
-	{
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-		.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT, // ?
-		.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		.newLayout = VK_IMAGE_LAYOUT_GENERAL, // does it flush more to transntion to PRESENT_SRC?
-		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		.image = compositeImage,
-		.subresourceRange = subResRange
-	};
-	
-	vkCmdPipelineBarrier( curCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-						  0, 0, nullptr, 0, nullptr, 1, &memoryBarrier );
-
-	if ( bScreenshot == true )
+	if ( pScreenshotTexture != nullptr )
 	{
 		if ( g_output.pScreenshotImage == nullptr )
 		{
@@ -2174,6 +2240,22 @@ bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *
 								  0, 0, nullptr, 0, nullptr, 1, &memoryBarrier );
 		}
 
+		VkImageMemoryBarrier memoryBarrier =
+		{
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = compositeImage,
+			.subresourceRange = subResRange
+		};
+	
+		vkCmdPipelineBarrier( curCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				      0, 0, nullptr, 0, nullptr, 1, &memoryBarrier );
+
 		VkImageCopy region = {};
 
 		region.srcSubresource = {
@@ -2193,7 +2275,32 @@ bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *
 		};
 
 		vkCmdCopyImage( curCommandBuffer, compositeImage, VK_IMAGE_LAYOUT_GENERAL, g_output.pScreenshotImage->m_vkImage, VK_IMAGE_LAYOUT_GENERAL, 1, &region );
+
+		*pScreenshotTexture = g_output.pScreenshotImage;
 	}
+
+	bool useForeignQueue = !BIsNested() && g_vulkanSupportsModifiers;
+
+	/* The non-foreign path is very hinky, and for the foreign path the acquire
+	 * barriers are still missing (but are unlikely to do anything on radv). Also
+	 * missing is the initial pipeline barrier from VK_IMAGE_LAYOUT_UNDEFINED. */
+	VkImageMemoryBarrier memoryBarrier =
+	{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = pScreenshotTexture ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_SHADER_WRITE_BIT,
+		.dstAccessMask = useForeignQueue ? (VkAccessFlagBits)0 : VK_ACCESS_MEMORY_READ_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = useForeignQueue ? VK_QUEUE_FAMILY_FOREIGN_EXT
+						       : VK_QUEUE_FAMILY_IGNORED,
+		.image = compositeImage,
+		.subresourceRange = subResRange
+	};
+	
+	vkCmdPipelineBarrier( curCommandBuffer, pScreenshotTexture ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			      useForeignQueue ? 0 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			      0, 0, nullptr, 0, nullptr, 1, &memoryBarrier );
 	
 	res = vkEndCommandBuffer( curCommandBuffer );
 	
@@ -2261,29 +2368,6 @@ bool vulkan_composite( struct Composite_t *pComposite, struct VulkanPipeline_t *
 	
 	vkQueueWaitIdle( queue );
 
-	if ( bScreenshot )
-	{
-		uint32_t redMask = 0x00ff0000;
-		uint32_t greenMask = 0x0000ff00;
-		uint32_t blueMask = 0x000000ff;
-		uint32_t alphaMask = 0;
-
-		SDL_Surface *pSDLSurface = SDL_CreateRGBSurfaceFrom( g_output.pScreenshotImage->m_pMappedData, currentOutputWidth, currentOutputHeight, 32,
-															 g_output.pScreenshotImage->m_unRowPitch, redMask, greenMask, blueMask, alphaMask );
-
-		static char pTimeBuffer[1024];
-
-		time_t currentTime = time(0);
-		struct tm *localTime = localtime( &currentTime );
-		strftime( pTimeBuffer, sizeof( pTimeBuffer ), "/tmp/gamescope_%Y-%m-%d_%H-%M-%S.bmp", localTime );
-
-		SDL_SaveBMP( pSDLSurface, pTimeBuffer );
-
-		SDL_FreeSurface( pSDLSurface );
-
-		fprintf(stderr, "Screenshot saved to %s\n", pTimeBuffer);
-	}
-	
 	if ( BIsNested() == false )
 	{
 		g_output.nOutImage = !g_output.nOutImage;
@@ -2313,15 +2397,40 @@ uint32_t vulkan_texture_get_fbid( VulkanTexture_t vulkanTex )
 	return ret;
 }
 
+int vulkan_texture_get_fence( VulkanTexture_t vulkanTex )
+{
+	assert ( vulkanTex != 0 );
+
+	const VkMemoryGetFdInfoKHR memory_get_fd_info = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+		.pNext = NULL,
+		.memory = g_mapVulkanTextures[ vulkanTex ]->m_vkImageMemory,
+		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+	};
+	int fence = -1;
+	VkResult res = dyn_vkGetMemoryFdKHR(device, &memory_get_fd_info, &fence);
+	if ( res != VK_SUCCESS ) {
+		fprintf( stderr, "vkGetMemoryFdKHR failed\n" );
+	}
+
+	return fence;
+}
+
 static void texture_destroy( struct wlr_texture *wlr_texture )
 {
 	VulkanWlrTexture_t *tex = (VulkanWlrTexture_t *)wlr_texture;
+	wlr_buffer_unlock( tex->buf );
 	delete tex;
 }
 
 static const struct wlr_texture_impl texture_impl = {
 	.destroy = texture_destroy,
 };
+
+static uint32_t renderer_get_render_buffer_caps( struct wlr_renderer *renderer )
+{
+	return 0;
+}
 
 static void renderer_begin( struct wlr_renderer *renderer, uint32_t width, uint32_t height )
 {
@@ -2353,37 +2462,11 @@ static void renderer_render_quad_with_matrix( struct wlr_renderer *renderer, con
 	abort(); // unreachable
 }
 
-static void renderer_render_ellipse_with_matrix( struct wlr_renderer *renderer, const float color[4], const float matrix[9] )
-{
-	abort(); // unreachable
-}
-
 static const uint32_t *renderer_get_shm_texture_formats( struct wlr_renderer *wlr_renderer, size_t *len
  )
 {
-	VulkanRenderer_t *renderer = (VulkanRenderer_t *) wlr_renderer;
-	return wlr_renderer_get_shm_texture_formats( renderer->parent, len );
-}
-
-static struct wlr_texture *renderer_texture_from_pixels( struct wlr_renderer *wlr_renderer, uint32_t shmFormat, uint32_t stride, uint32_t width, uint32_t height, const void *src )
-{
-	VulkanRenderer_t *renderer = (VulkanRenderer_t *) wlr_renderer;
-	return wlr_texture_from_pixels( renderer->parent, shmFormat, stride, width, height, src );
-}
-
-static bool renderer_init_wl_display( struct wlr_renderer *wlr_renderer, struct wl_display *wl_display )
-{
-	VulkanRenderer_t *renderer = (VulkanRenderer_t *) wlr_renderer;
-	struct wlr_egl *egl = wlr_gles2_renderer_get_egl( renderer->parent );
-	if ( !wlr_egl_bind_display( egl, wl_display ) )
-	{
-		return false;
-	}
-	if ( wlr_linux_dmabuf_v1_create( wl_display, wlr_renderer ) == nullptr )
-	{
-		return false;
-	}
-	return true;
+	*len = sampledShmFormats.size();
+	return sampledShmFormats.data();
 }
 
 static const struct wlr_drm_format_set *renderer_get_dmabuf_texture_formats( struct wlr_renderer *wlr_renderer )
@@ -2391,31 +2474,19 @@ static const struct wlr_drm_format_set *renderer_get_dmabuf_texture_formats( str
 	return &sampledDRMFormats;
 }
 
-static struct wlr_texture *renderer_texture_from_dmabuf( struct wlr_renderer *wlr_renderer, struct wlr_dmabuf_attributes *dmabuf )
+static int renderer_get_drm_fd( struct wlr_renderer *wlr_renderer )
+{
+	return g_drmRenderFd;
+}
+
+static struct wlr_texture *renderer_texture_from_buffer( struct wlr_renderer *wlr_renderer, struct wlr_buffer *buf )
 {
 	VulkanWlrTexture_t *tex = new VulkanWlrTexture_t();
-	wlr_texture_init( &tex->base, &texture_impl, dmabuf->width, dmabuf->height );
+	wlr_texture_init( &tex->base, &texture_impl, buf->width, buf->height );
+	tex->buf = wlr_buffer_lock( buf );
 	// TODO: check format/modifier
-	// TODO: try importing it into Vulkan
+	// TODO: if DMA-BUF, try importing it into Vulkan
 	return &tex->base;
-}
-
-static bool renderer_resource_is_wl_drm_buffer( struct wlr_renderer *wlr_renderer, struct wl_resource *resource )
-{
-	VulkanRenderer_t *renderer = (VulkanRenderer_t *) wlr_renderer;
-	return wlr_renderer_resource_is_wl_drm_buffer( renderer->parent, resource );
-}
-
-static void renderer_wl_drm_buffer_get_size( struct wlr_renderer *wlr_renderer, struct wl_resource *resource, int *width, int *height )
-{
-	VulkanRenderer_t *renderer = (VulkanRenderer_t *) wlr_renderer;
-	return wlr_renderer_wl_drm_buffer_get_size( renderer->parent, resource, width, height );
-}
-
-struct wlr_texture *renderer_texture_from_wl_drm( struct wlr_renderer *wlr_renderer, struct wl_resource *resource )
-{
-	VulkanRenderer_t *renderer = (VulkanRenderer_t *) wlr_renderer;
-	return wlr_texture_from_wl_drm( renderer->parent, resource );
 }
 
 static const struct wlr_renderer_impl renderer_impl = {
@@ -2425,21 +2496,132 @@ static const struct wlr_renderer_impl renderer_impl = {
 	.scissor = renderer_scissor,
 	.render_subtexture_with_matrix = renderer_render_subtexture_with_matrix,
 	.render_quad_with_matrix = renderer_render_quad_with_matrix,
-	.render_ellipse_with_matrix = renderer_render_ellipse_with_matrix,
 	.get_shm_texture_formats = renderer_get_shm_texture_formats,
-	.resource_is_wl_drm_buffer = renderer_resource_is_wl_drm_buffer,
-	.wl_drm_buffer_get_size = renderer_wl_drm_buffer_get_size,
 	.get_dmabuf_texture_formats = renderer_get_dmabuf_texture_formats,
-	.texture_from_pixels = renderer_texture_from_pixels,
-	.texture_from_wl_drm = renderer_texture_from_wl_drm,
-	.texture_from_dmabuf = renderer_texture_from_dmabuf,
-	.init_wl_display = renderer_init_wl_display,
+	.get_drm_fd = renderer_get_drm_fd,
+	.get_render_buffer_caps = renderer_get_render_buffer_caps,
+	.texture_from_buffer = renderer_texture_from_buffer,
 };
 
-struct wlr_renderer *vulkan_renderer_create( struct wlr_renderer *parent )
+struct wlr_renderer *vulkan_renderer_create( void )
 {
 	VulkanRenderer_t *renderer = new VulkanRenderer_t();
 	wlr_renderer_init(&renderer->base, &renderer_impl);
-	renderer->parent = parent;
 	return &renderer->base;
+}
+
+VulkanTexture_t vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf )
+{
+
+	struct wlr_dmabuf_attributes dmabuf = {0};
+	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
+	{
+		return vulkan_create_texture_from_dmabuf( &dmabuf );
+	}
+
+	VkResult result;
+
+	void *src;
+	uint32_t drmFormat;
+	size_t stride;
+	if ( wlr_buffer_begin_data_ptr_access( buf, WLR_BUFFER_DATA_PTR_ACCESS_READ, &src, &drmFormat, &stride ) )
+	{
+		return 0;
+	}
+
+	VkFormat format = DRMFormatToVulkan( drmFormat );
+	uint32_t width = buf->width;
+	uint32_t height = buf->height;
+
+	VkBufferCreateInfo bufferCreateInfo = {};
+	bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bufferCreateInfo.size = stride * height;
+	bufferCreateInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VkBuffer buffer;
+	result = vkCreateBuffer( device, &bufferCreateInfo, nullptr, &buffer );
+	if ( result != VK_SUCCESS )
+	{
+		wlr_buffer_end_data_ptr_access( buf );
+		return 0;
+	}
+
+	VkMemoryRequirements memRequirements;
+	vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
+
+	int memTypeIndex =  findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
+	if ( memTypeIndex == -1 )
+	{
+		wlr_buffer_end_data_ptr_access( buf );
+		return 0;
+	}
+
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = memRequirements.size;
+	allocInfo.memoryTypeIndex = memTypeIndex;
+
+	VkDeviceMemory bufferMemory;
+	result = vkAllocateMemory( device, &allocInfo, nullptr, &bufferMemory);
+	if ( result != VK_SUCCESS )
+	{
+		wlr_buffer_end_data_ptr_access( buf );
+		return 0;
+	}
+
+	result = vkBindBufferMemory( device, buffer, bufferMemory, 0 );
+	if ( result != VK_SUCCESS )
+	{
+		wlr_buffer_end_data_ptr_access( buf );
+		return 0;
+	}
+
+	void *dst;
+	result = vkMapMemory( device, bufferMemory, 0, VK_WHOLE_SIZE, 0, &dst );
+	if ( result != VK_SUCCESS )
+	{
+		wlr_buffer_end_data_ptr_access( buf );
+		return 0;
+	}
+
+	memcpy( dst, src, stride * height );
+
+	vkUnmapMemory( device, bufferMemory );
+
+	wlr_buffer_end_data_ptr_access( buf );
+
+	CVulkanTexture *pTex = new CVulkanTexture();
+	CVulkanTexture::createFlags texCreateFlags = {};
+	texCreateFlags.bTextureable = true;
+	texCreateFlags.bTransferDst = true;
+	if ( pTex->BInit( width, height, format, texCreateFlags ) == false )
+	{
+		delete pTex;
+		return 0;
+	}
+
+	VkCommandBuffer commandBuffer;
+	uint32_t handle = get_command_buffer( commandBuffer, nullptr );
+
+	VkBufferImageCopy region = {};
+	region.imageSubresource = {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.layerCount = 1
+	};
+	region.imageExtent = {
+		.width = width,
+		.height = height,
+		.depth = 1
+	};
+	vkCmdCopyBufferToImage( commandBuffer, buffer, pTex->m_vkImage, VK_IMAGE_LAYOUT_GENERAL, 1, &region );
+
+	std::vector<CVulkanTexture *> refs;
+	refs.push_back( pTex );
+
+	submit_command_buffer( handle, refs );
+
+	VulkanTexture_t texid = ++g_nMaxVulkanTexHandle;
+	pTex->handle = texid;
+	g_mapVulkanTextures[ texid ] = pTex;
+
+	return texid;
 }

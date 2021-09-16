@@ -1,5 +1,6 @@
 // DRM output stuff
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,6 +22,7 @@ extern "C" {
 #include "main.hpp"
 #include "vblankmanager.hpp"
 #include "wlserver.hpp"
+#include "log.hpp"
 
 #include "gpuvis_trace_utils.h"
 
@@ -36,7 +38,8 @@ bool g_bUseLayers = true;
 bool g_bDebugLayers = false;
 const char *g_sOutputName = nullptr;
 
-static int s_drm_log = 0;
+static LogScope drm_log("drm");
+static LogScope drm_verbose_log("drm", LOG_SILENT);
 
 static std::map< uint32_t, const char * > connector_types = {
 	{ DRM_MODE_CONNECTOR_Unknown, "Unknown" },
@@ -49,7 +52,7 @@ static std::map< uint32_t, const char * > connector_types = {
 	{ DRM_MODE_CONNECTOR_LVDS, "LVDS" },
 	{ DRM_MODE_CONNECTOR_Component, "Component" },
 	{ DRM_MODE_CONNECTOR_9PinDIN, "DIN" },
-	{ DRM_MODE_CONNECTOR_DisplayPort, "DisplayPort" },
+	{ DRM_MODE_CONNECTOR_DisplayPort, "DP" },
 	{ DRM_MODE_CONNECTOR_HDMIA, "HDMI-A" },
 	{ DRM_MODE_CONNECTOR_HDMIB, "HDMI-B" },
 	{ DRM_MODE_CONNECTOR_TV, "TV" },
@@ -64,35 +67,33 @@ static std::map< uint32_t, const char * > connector_types = {
 #endif
 };
 
-static struct crtc *find_crtc_for_encoder(struct drm_t *drm, const drmModeEncoder *encoder) {
-	for (size_t i = 0; i < drm->crtcs.size(); i++) {
-		/* possible_crtcs is a bitmask as described here:
-		 * https://dvdhrm.wordpress.com/2012/09/13/linux-drm-mode-setting-api
-		 */
-		uint32_t crtc_mask = 1 << i;
-		if (encoder->possible_crtcs & crtc_mask)
-			return &drm->crtcs[i];
-	}
+static uint32_t get_connector_possible_crtcs(struct drm_t *drm, const drmModeConnector *connector) {
+	uint32_t possible_crtcs = 0;
 
-	/* no match found */
-	return nullptr;
-}
-
-static struct crtc *find_crtc_for_connector(struct drm_t *drm, const drmModeConnector *connector) {
 	for (int i = 0; i < connector->count_encoders; i++) {
 		uint32_t encoder_id = connector->encoders[i];
 
 		drmModeEncoder *encoder = drmModeGetEncoder(drm->fd, encoder_id);
-		if (encoder == nullptr)
+		if (encoder == nullptr) {
+			drm_log.errorf_errno("drmModeGetEncoder failed");
 			continue;
+		}
 
-		struct crtc *crtc = find_crtc_for_encoder(drm, encoder);
+		possible_crtcs |= encoder->possible_crtcs;
+
 		drmModeFreeEncoder(encoder);
-		if (crtc != nullptr)
-			return crtc;
 	}
 
-	/* no match found */
+	return possible_crtcs;
+}
+
+static struct crtc *find_crtc_for_connector(struct drm_t *drm, const struct connector *connector) {
+	for (size_t i = 0; i < drm->crtcs.size(); i++) {
+		uint32_t crtc_mask = 1 << i;
+		if (connector->possible_crtcs & crtc_mask)
+			return &drm->crtcs[i];
+	}
+
 	return nullptr;
 }
 
@@ -107,7 +108,7 @@ static bool get_plane_formats(struct drm_t *drm, struct plane *plane, struct wlr
 
 		drmModePropertyBlobRes *blob = drmModeGetPropertyBlob(drm->fd, blob_id);
 		if (!blob) {
-			perror("drmModeGetPropertyBlob(IN_FORMATS) failed");
+			drm_log.errorf_errno("drmModeGetPropertyBlob(IN_FORMATS) failed");
 			return false;
 		}
 
@@ -183,11 +184,8 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 
 	// TODO: get the fbids_queued instance from data if we ever have more than one in flight
 
-	if ( s_drm_log != 0 )
-	{
-		fprintf(stderr, "page_flip_handler %lu\n", flipcount);
-	}
-	gpuvis_trace_printf("page_flip_handler %lu", flipcount);
+	drm_verbose_log.debugf("page_flip_handler %" PRIu64, flipcount);
+	gpuvis_trace_printf("page_flip_handler %" PRIu64, flipcount);
 
 	for ( uint32_t i = 0; i < g_DRM.fbids_on_screen.size(); i++ )
 	{
@@ -206,10 +204,8 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 			{
 				if ( g_DRM.fbid_free_queue[ i ] == previous_fbid )
 				{
-					if ( s_drm_log != 0 )
-					{
-						fprintf(stderr, "deferred free %u\n", previous_fbid);
-					}
+					drm_verbose_log.debugf("deferred free %u", previous_fbid);
+
 					drm_free_fb( &g_DRM, &g_DRM.map_fbid_inflightflips[ previous_fbid ] );
 
 					g_DRM.fbid_free_queue.erase( g_DRM.fbid_free_queue.begin() + i );
@@ -236,7 +232,7 @@ void flip_handler_thread_run(void)
 	{
 		int ret = poll( &pollfd, 1, -1 );
 		if ( ret < 0 ) {
-			perror( "drm: polling for DRM events failed" );
+			drm_log.errorf_errno( "polling for DRM events failed" );
 			break;
 		}
 
@@ -256,7 +252,7 @@ static const drmModePropertyRes *get_prop(struct drm_t *drm, uint32_t prop_id)
 
 	drmModePropertyRes *prop = drmModeGetProperty(drm->fd, prop_id);
 	if (!prop) {
-		perror("drmModeGetProperty failed");
+		drm_log.errorf_errno("drmModeGetProperty failed");
 		return nullptr;
 	}
 
@@ -268,7 +264,7 @@ static bool get_object_properties(struct drm_t *drm, uint32_t obj_id, uint32_t o
 {
 	drmModeObjectProperties *props = drmModeObjectGetProperties(drm->fd, obj_id, obj_type);
 	if (!props) {
-		perror("drmModeObjectGetProperties failed");
+		drm_log.errorf_errno("drmModeObjectGetProperties failed");
 		return false;
 	}
 
@@ -309,10 +305,22 @@ static bool refresh_state( drm_t *drm )
 
 	for (size_t i = 0; i < drm->connectors.size(); i++) {
 		struct connector *conn = &drm->connectors[i];
-		// TODO: refresh connector status and mode list
 		if (!get_object_properties(drm, conn->id, DRM_MODE_OBJECT_CONNECTOR, conn->props, conn->initial_prop_values)) {
 			return false;
 		}
+
+		if (conn->connector != nullptr)
+			drmModeFreeConnector(conn->connector);
+
+		conn->connector = drmModeGetConnector(drm->fd, conn->id);
+		if (conn->connector == nullptr) {
+			drm_log.errorf_errno("drmModeGetConnector failed");
+			return false;
+		}
+
+		/* sort modes by preference: preferred flag, then highest area, then
+		 * highest refresh rate */
+		std::stable_sort(conn->connector->modes, conn->connector->modes + conn->connector->count_modes, compare_modes);
 	}
 
 	for (size_t i = 0; i < drm->crtcs.size(); i++) {
@@ -338,23 +346,12 @@ static bool get_resources(struct drm_t *drm)
 {
 	drmModeRes *resources = drmModeGetResources(drm->fd);
 	if (resources == nullptr) {
-		perror("drmModeGetResources failed");
+		drm_log.errorf_errno("drmModeGetResources failed");
 		return false;
 	}
 
 	for (int i = 0; i < resources->count_connectors; i++) {
 		struct connector conn = { .id = resources->connectors[i] };
-
-		conn.connector = drmModeGetConnector(drm->fd, conn.id);
-		if (conn.connector == nullptr) {
-			perror("drmModeGetConnector failed");
-			return false;
-		}
-
-		/* sort modes by preference: preferred flag, then highest area, then
-		 * highest refresh rate */
-		std::stable_sort(conn.connector->modes, conn.connector->modes + conn.connector->count_modes, compare_modes);
-
 		drm->connectors.push_back(conn);
 	}
 
@@ -363,7 +360,7 @@ static bool get_resources(struct drm_t *drm)
 
 		crtc.crtc = drmModeGetCrtc(drm->fd, crtc.id);
 		if (crtc.crtc == nullptr) {
-			perror("drmModeGetCrtc failed");
+			drm_log.errorf_errno("drmModeGetCrtc failed");
 			return false;
 		}
 
@@ -374,7 +371,7 @@ static bool get_resources(struct drm_t *drm)
 
 	drmModePlaneRes *plane_resources = drmModeGetPlaneResources(drm->fd);
 	if (!plane_resources) {
-		perror("drmModeGetPlaneResources failed");
+		drm_log.errorf_errno("drmModeGetPlaneResources failed");
 		return false;
 	}
 
@@ -383,7 +380,7 @@ static bool get_resources(struct drm_t *drm)
 
 		plane.plane = drmModeGetPlane(drm->fd, plane.id);
 		if (plane.plane == nullptr) {
-			perror("drmModeGetPlane failed");
+			drm_log.errorf_errno("drmModeGetPlane failed");
 			return false;
 		}
 
@@ -406,6 +403,8 @@ static bool get_resources(struct drm_t *drm)
 		snprintf(name, sizeof(name), "%s-%d", type_str, conn->connector->connector_type_id);
 
 		conn->name = strdup(name);
+
+		conn->possible_crtcs = get_connector_possible_crtcs(drm, conn->connector);
 	}
 
 	for (size_t i = 0; i < drm->crtcs.size(); i++) {
@@ -414,23 +413,6 @@ static bool get_resources(struct drm_t *drm)
 	}
 
 	return true;
-}
-
-static struct connector *find_connector( drm_t *drm, const char *name )
-{
-	for (size_t i = 0; i < drm->connectors.size(); i++) {
-		struct connector *conn = &drm->connectors[i];
-
-		if (conn->connector->connection != DRM_MODE_CONNECTED)
-			continue;
-
-		if ( name != nullptr && strcmp( conn->name, name ) != 0 )
-			continue;
-
-		return conn;
-	}
-
-	return nullptr;
 }
 
 static const drmModeModeInfo *find_mode( const drmModeConnector *connector, int hdisplay, int vdisplay, uint32_t vrefresh )
@@ -451,48 +433,85 @@ static const drmModeModeInfo *find_mode( const drmModeConnector *connector, int 
 	return NULL;
 }
 
+static std::unordered_map<std::string, int> parse_connector_priorities(const char *str)
+{
+	std::unordered_map<std::string, int> priorities{};
+	if (!str) {
+		return priorities;
+	}
+	int i = 0;
+	char *buf = strdup(str);
+	char *name = strtok(buf, ",");
+	while (name) {
+		priorities[name] = i;
+		i++;
+		name = strtok(nullptr, ",");
+	}
+	free(buf);
+	return priorities;
+}
+
+static int get_connector_priority(struct drm_t *drm, const char *name)
+{
+	if (drm->connector_priorities.count(name) > 0) {
+		return drm->connector_priorities[name];
+	}
+	if (drm->connector_priorities.count("*") > 0) {
+		return drm->connector_priorities["*"];
+	}
+	return drm->connector_priorities.size();
+}
+
 static bool setup_best_connector(struct drm_t *drm)
 {
 	if (drm->connector && drm->connector->connector->connection != DRM_MODE_CONNECTED) {
-		fprintf(stderr, "drm: connector '%s' disconnected\n", drm->connector->name);
+		drm_log.infof("current connector '%s' disconnected", drm->connector->name);
 		drm->connector = nullptr;
 	}
 
-	struct connector *connector = find_connector( drm, g_sOutputName );
-	if ((!connector && drm->connector) || (connector && connector == drm->connector)) {
+	struct connector *best = nullptr;
+	int best_priority = INT_MAX;
+	for (size_t i = 0; i < drm->connectors.size(); i++) {
+		struct connector *conn = &drm->connectors[i];
+
+		if (conn->connector->connection != DRM_MODE_CONNECTED)
+			continue;
+
+		int priority = get_connector_priority(drm, conn->name);
+		if (priority < best_priority) {
+			best = conn;
+			best_priority = priority;
+		}
+	}
+
+	if ((!best && drm->connector) || (best && best == drm->connector)) {
 		// Let's keep our current connector
 		return true;
 	}
 
-	if ( g_sOutputName != nullptr && connector == nullptr ) {
-		fprintf( stderr, "drm: warning: cannot find connector '%s', falling back to another one\n", g_sOutputName );
-		connector = find_connector( drm, nullptr );
-	}
-
-	if ( connector == nullptr ) {
+	if ( best == nullptr ) {
 		/* we could be fancy and listen for hotplug events and wait for
-		 * a connector..
-		 */
-		fprintf( stderr, "Cannot find any connector!\n" );
+		 * a connector.. */
+		drm_log.errorf("cannot find any connector!");
 		return false;
 	}
 
-	if (!drm_set_connector(drm, connector)) {
+	if (!drm_set_connector(drm, best)) {
 		return false;
 	}
 
 	const drmModeModeInfo *mode = nullptr;
-	if ( g_nOutputWidth != 0 || g_nOutputHeight != 0 || g_nNestedRefresh != 0 )
+	if ( drm->preferred_width != 0 || drm->preferred_height != 0 || drm->preferred_refresh != 0 )
 	{
-		mode = find_mode(connector->connector, g_nOutputWidth, g_nOutputHeight, g_nNestedRefresh);
+		mode = find_mode(best->connector, drm->preferred_width, drm->preferred_height, drm->preferred_refresh);
 	}
 
 	if (!mode) {
-		mode = find_mode(connector->connector, 0, 0, 0);
+		mode = find_mode(best->connector, 0, 0, 0);
 	}
 
 	if (!mode) {
-		fprintf(stderr, "drm: could not find mode!\n");
+		drm_log.errorf("could not find mode!");
 		return false;
 	}
 
@@ -503,18 +522,79 @@ static bool setup_best_connector(struct drm_t *drm)
 	return true;
 }
 
-int init_drm(struct drm_t *drm, const char *device_name)
+char *find_drm_node_by_devid(dev_t devid)
 {
+	// TODO: replace all of this with drmGetDeviceFromDevId once it's available
+
+	drmDevice *devices[32];
+	int devices_len = drmGetDevices2(0, devices, sizeof(devices) / sizeof(devices[0]));
+	if (devices_len < 0) {
+		drm_log.errorf_errno("drmGetDevices2 failed");
+		return nullptr;
+	}
+
+	char *name = nullptr;
+	for (int i = 0; i < devices_len; i++) {
+		drmDevice *dev = devices[i];
+
+		const int node_types[] = { DRM_NODE_PRIMARY, DRM_NODE_RENDER };
+		for (size_t j = 0; j < sizeof(node_types) / sizeof(node_types[0]); j++) {
+			int node = node_types[j];
+
+			if (!(dev->available_nodes & (1 << node)))
+				continue;
+
+			struct stat dev_stat = {};
+			if (stat(dev->nodes[node], &dev_stat) != 0) {
+				drm_log.errorf_errno("stat(%s) failed", dev->nodes[node]);
+				continue;
+			}
+
+			if (dev_stat.st_rdev == devid) {
+				name = strdup(dev->nodes[node]);
+				break;
+			}
+		}
+
+		if (name != nullptr)
+			break;
+	}
+
+	drmFreeDevices(devices, devices_len);
+	return name;
+}
+
+bool init_drm(struct drm_t *drm, int width, int height, int refresh)
+{
+	drm->preferred_width = width;
+	drm->preferred_height = height;
+	drm->preferred_refresh = refresh;
+
+	char *device_name = nullptr;
+	if (g_vulkanHasDrmPrimaryDevId) {
+		device_name = find_drm_node_by_devid(g_vulkanDrmPrimaryDevId);
+		if (device_name == nullptr) {
+			drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)g_vulkanDrmPrimaryDevId);
+			return false;
+		}
+		drm_log.infof("opening DRM node '%s'", device_name);
+	}
+	else
+	{
+		drm_log.infof("warning: picking an arbitrary DRM device");
+	}
+
 	drm->fd = wlsession_open_kms( device_name );
+	free(device_name);
 	if ( drm->fd < 0 )
 	{
-		fprintf(stderr, "Could not open KMS device\n");
-		return -1;
+		drm_log.errorf("Could not open KMS device");
+		return false;
 	}
 
 	if (drmSetClientCap(drm->fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
-		fprintf(stderr, "drmSetClientCap(ATOMIC) failed\n");
-		return -1;
+		drm_log.errorf("drmSetClientCap(ATOMIC) failed");
+		return false;
 	}
 
 	if (drmGetCap(drm->fd, DRM_CAP_CURSOR_WIDTH, &drm->cursor_width) != 0) {
@@ -530,10 +610,16 @@ int init_drm(struct drm_t *drm, const char *device_name)
 	}
 
 	if (!get_resources(drm)) {
-		return -1;
+		return false;
 	}
 
-	fprintf( stderr, "Connectors:\n" );
+	drm->lo_device = liftoff_device_create( drm->fd );
+	if ( drm->lo_device == nullptr )
+		return false;
+	if ( liftoff_device_register_all_planes( drm->lo_device ) < 0 )
+		return false;
+
+	drm_log.infof("Connectors:");
 	for (size_t i = 0; i < drm->connectors.size(); i++) {
 		struct connector *conn = &drm->connectors[i];
 
@@ -541,28 +627,30 @@ int init_drm(struct drm_t *drm, const char *device_name)
 		if ( conn->connector->connection == DRM_MODE_CONNECTED )
 			status_str = "connected";
 
-		fprintf( stderr, "  %s (%s)\n", conn->name, status_str );
+		drm_log.infof("  %s (%s)", conn->name, status_str);
 	}
 
+	drm->connector_priorities = parse_connector_priorities( g_sOutputName );
+
 	if (!setup_best_connector(drm)) {
-		return -1;
+		return false;
 	}
 
 	// Fetch formats which can be scanned out
 	for (size_t i = 0; i < drm->planes.size(); i++) {
 		struct plane *plane = &drm->planes[i];
 		if (!get_plane_formats(drm, plane, &drm->formats))
-			return -1;
+			return false;
 	}
 
 	if (!get_plane_formats(drm, drm->primary, &drm->primary_formats)) {
-		return -1;
+		return false;
 	}
 
 	g_nDRMFormat = pick_plane_format(&drm->primary_formats);
 	if ( g_nDRMFormat == DRM_FORMAT_INVALID ) {
-		fprintf( stderr, "Primary plane doesn't support XRGB8888 nor ARGB8888\n" );
-		return -1;
+		drm_log.errorf("Primary plane doesn't support XRGB8888 nor ARGB8888");
+		return false;
 	}
 
 	drm->kms_in_fence_fd = -1;
@@ -574,30 +662,17 @@ int init_drm(struct drm_t *drm, const char *device_name)
 		liftoff_log_set_priority(g_bDebugLayers ? LIFTOFF_DEBUG : LIFTOFF_ERROR);
 	}
 
-	drm->lo_device = liftoff_device_create( drm->fd );
-	drm->lo_output = liftoff_output_create( drm->lo_device, drm->crtc->id );
-
-	liftoff_device_register_all_planes( drm->lo_device );
-
-	assert( drm->lo_device && drm->lo_output );
-
-	for ( int i = 0; i < k_nMaxLayers; i++ )
-	{
-		drm->lo_layers[ i ] = liftoff_layer_create( drm->lo_output );
-		assert( drm->lo_layers[ i ] );
-	}
-
 	drm->flipcount = 0;
 	drm->needs_modeset = true;
 
-	return 0;
+	return true;
 }
 
 static int add_property(drmModeAtomicReq *req, uint32_t obj_id, std::map<std::string, const drmModePropertyRes *> &props, const char *name, uint64_t value)
 {
 	if ( props.count( name ) == 0 )
 	{
-		fprintf(stderr, "no property %s on object %u\n", name, obj_id);
+		drm_log.errorf("no property %s on object %u", name, obj_id);
 		return -EINVAL;
 	}
 
@@ -606,7 +681,7 @@ static int add_property(drmModeAtomicReq *req, uint32_t obj_id, std::map<std::st
 	int ret = drmModeAtomicAddProperty(req, obj_id, prop->prop_id, value);
 	if ( ret < 0 )
 	{
-		perror( "drmModeAtomicAddProperty failed" );
+		drm_log.errorf_errno( "drmModeAtomicAddProperty failed" );
 	}
 	return ret;
 }
@@ -624,6 +699,49 @@ static int add_crtc_property(drmModeAtomicReq *req, struct crtc *crtc, const cha
 static int add_plane_property(drmModeAtomicReq *req, struct plane *plane, const char *name, uint64_t value)
 {
 	return add_property(req, plane->id, plane->props, name, value);
+}
+
+void finish_drm(struct drm_t *drm)
+{
+	// Disable all connectors, CRTCs and planes. This is necessary to leave a
+	// clean KMS state behind. Some other KMS clients might not support all of
+	// the properties we use, e.g. "rotation" and Xorg don't play well
+	// together.
+
+	drmModeAtomicReq *req = drmModeAtomicAlloc();
+	for ( size_t i = 0; i < drm->connectors.size(); i++ ) {
+		add_connector_property(req, &drm->connectors[i], "CRTC_ID", 0);
+	}
+	for ( size_t i = 0; i < drm->crtcs.size(); i++ ) {
+		add_crtc_property(req, &drm->crtcs[i], "MODE_ID", 0);
+		add_crtc_property(req, &drm->crtcs[i], "ACTIVE", 0);
+	}
+	for ( size_t i = 0; i < drm->planes.size(); i++ ) {
+		struct plane *plane = &drm->planes[i];
+		add_plane_property(req, plane, "FB_ID", 0);
+		add_plane_property(req, plane, "CRTC_ID", 0);
+		add_plane_property(req, plane, "SRC_X", 0);
+		add_plane_property(req, plane, "SRC_Y", 0);
+		add_plane_property(req, plane, "SRC_W", 0);
+		add_plane_property(req, plane, "SRC_H", 0);
+		add_plane_property(req, plane, "CRTC_X", 0);
+		add_plane_property(req, plane, "CRTC_Y", 0);
+		add_plane_property(req, plane, "CRTC_W", 0);
+		add_plane_property(req, plane, "CRTC_H", 0);
+		if (plane->props.count("rotation") > 0)
+			add_plane_property(req, plane, "rotation", DRM_MODE_ROTATE_0);
+	}
+	// We can't do a non-blocking commit here or else risk EBUSY in case the
+	// previous page-flip is still in flight.
+	uint32_t flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+	int ret = drmModeAtomicCommit( drm->fd, req, flags, nullptr );
+	if ( ret != 0 ) {
+		drm_log.errorf_errno( "finish_drm: drmModeAtomicCommit failed" );
+	}
+	drmModeAtomicFree(req);
+
+	// We can't close the DRM FD here, it might still be in use by the
+	// page-flip handler thread.
 }
 
 int drm_commit(struct drm_t *drm, struct Composite_t *pComposite, struct VulkanPipeline_t *pPipeline )
@@ -656,16 +774,14 @@ int drm_commit(struct drm_t *drm, struct Composite_t *pComposite, struct VulkanP
 
 	g_DRM.flipcount++;
 
-	if ( s_drm_log != 0 )
-	{
-		fprintf(stderr, "flip commit %lu\n", (uint64_t)g_DRM.flipcount);
-	}
-	gpuvis_trace_printf( "flip commit %lu", (uint64_t)g_DRM.flipcount );
+	drm_verbose_log.debugf("flip commit %" PRIu64, (uint64_t)g_DRM.flipcount);
+	gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)g_DRM.flipcount );
 
 	ret = drmModeAtomicCommit(drm->fd, drm->req, drm->flags, (void*)(uint64_t)g_DRM.flipcount );
 	if ( ret != 0 )
 	{
-		fprintf( stderr, "flip error: %s\n", strerror( -ret ) );
+		drm_log.errorf_errno( "flip error" );
+
 		if ( ret != -EBUSY && ret != -EACCES )
 		{
 			exit( 1 );
@@ -726,10 +842,7 @@ uint32_t drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_buffer *buf, struct
 
 	if ( !wlr_drm_format_set_has( &drm->formats, dma_buf->format, dma_buf->modifier ) )
 	{
-		if ( s_drm_log != 0 )
-		{
-			fprintf( stderr, "Cannot import FB to DRM: format 0x%" PRIX32 " and modifier 0x%" PRIX64 " not supported for scan-out\n", dma_buf->format, dma_buf->modifier );
-		}
+		drm_verbose_log.errorf( "Cannot import FB to DRM: format 0x%" PRIX32 " and modifier 0x%" PRIX64 " not supported for scan-out", dma_buf->format, dma_buf->modifier );
 		return 0;
 	}
 
@@ -738,8 +851,8 @@ uint32_t drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_buffer *buf, struct
 	for ( int i = 0; i < dma_buf->n_planes; i++ ) {
 		if ( drmPrimeFDToHandle( drm->fd, dma_buf->fd[i], &handles[i] ) != 0 )
 		{
-			perror("drmPrimeFDToHandle failed");
-			return 0;
+			drm_log.errorf_errno("drmPrimeFDToHandle failed");
+			goto out;
 		}
 
 		/* KMS requires all planes to have the same modifier */
@@ -750,29 +863,26 @@ uint32_t drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_buffer *buf, struct
 	{
 		if ( !drm->allow_modifiers )
 		{
-			fprintf(stderr, "Cannot import DMA-BUF: has a modifier (0x%" PRIX64 "), but KMS doesn't support them\n", dma_buf->modifier);
-			return 0;
+			drm_log.errorf("Cannot import DMA-BUF: has a modifier (0x%" PRIX64 "), but KMS doesn't support them", dma_buf->modifier);
+			goto out;
 		}
 
 		if ( drmModeAddFB2WithModifiers( drm->fd, dma_buf->width, dma_buf->height, dma_buf->format, handles, dma_buf->stride, dma_buf->offset, modifiers, &fb_id, DRM_MODE_FB_MODIFIERS ) != 0 )
 		{
-			perror("drmModeAddFB2WithModifiers failed");
-			return 0;
+			drm_log.errorf_errno("drmModeAddFB2WithModifiers failed");
+			goto out;
 		}
 	}
 	else
 	{
 		if ( drmModeAddFB2( drm->fd, dma_buf->width, dma_buf->height, dma_buf->format, handles, dma_buf->stride, dma_buf->offset, &fb_id, 0 ) != 0 )
 		{
-			perror("drmModeAddFB2 failed");
-			return 0;
+			drm_log.errorf_errno("drmModeAddFB2 failed");
+			goto out;
 		}
 	}
 
-	if ( s_drm_log != 0 )
-	{
-		fprintf(stderr, "make fbid %u\n", fb_id);
-	}
+	drm_verbose_log.debugf("make fbid %u", fb_id);
 	assert( drm->map_fbid_inflightflips[ fb_id ].held == false );
 
 	if ( buf != nullptr )
@@ -787,6 +897,28 @@ uint32_t drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_buffer *buf, struct
 	drm->map_fbid_inflightflips[ fb_id ].held = true;
 	drm->map_fbid_inflightflips[ fb_id ].n_refs = 0;
 
+out:
+	for ( int i = 0; i < dma_buf->n_planes; i++ ) {
+		if ( handles[i] == 0 )
+			continue;
+
+		// GEM handles aren't ref'counted by the kernel. Two DMA-BUFs may
+		// return the same GEM handle, we need to be careful not to
+		// double-close them.
+		bool already_closed = false;
+		for ( int j = 0; j < i; j++ ) {
+			if ( handles[i] == handles[j] )
+				already_closed = true;
+		}
+		if ( already_closed )
+			continue;
+
+		struct drm_gem_close args = { .handle = handles[i] };
+		if ( drmIoctl( drm->fd, DRM_IOCTL_GEM_CLOSE, &args ) != 0 ) {
+			drm_log.errorf_errno( "drmIoctl(GEM_CLOSE) failed" );
+		}
+	}
+
 	return fb_id;
 }
 
@@ -797,7 +929,7 @@ static void drm_free_fb( struct drm_t *drm, struct fb *fb )
 
 	if ( drmModeRmFB( drm->fd, fb->id ) != 0 )
 	{
-		perror( "drmModeRmFB failed" );
+		drm_log.errorf_errno( "drmModeRmFB failed" );
 	}
 
 	if ( fb->buf != nullptr )
@@ -818,10 +950,7 @@ void drm_drop_fbid( struct drm_t *drm, uint32_t fbid )
 	if ( drm->map_fbid_inflightflips[ fbid ].n_refs == 0 )
 	{
 		/* FB isn't being used in any page-flip, free it immediately */
-		if ( s_drm_log != 0 )
-		{
-			fprintf(stderr, "free fbid %u\n", fbid);
-		}
+		drm_verbose_log.debugf("free fbid %u", fbid);
 		drm_free_fb( drm, &drm->map_fbid_inflightflips[ fbid ] );
 	}
 	else
@@ -841,15 +970,13 @@ drm_prepare_basic( struct drm_t *drm, const struct Composite_t *pComposite, cons
 	// It only supports one layer
 	if ( pComposite->nLayerCount > 1 )
 	{
-		if ( s_drm_log != 0 )
-			fprintf( stderr, "drm_prepare_basic: cannot handle %d layers\n", pComposite->nLayerCount );
+		drm_verbose_log.errorf("drm_prepare_basic: cannot handle %d layers", pComposite->nLayerCount);
 		return -EINVAL;
 	}
 
 	if ( pPipeline->layerBindings[ 0 ].fbid == 0 )
 	{
-		if ( s_drm_log != 0 )
-			fprintf( stderr, "drm_prepare_basic: layer has no FB\n" );
+		drm_verbose_log.errorf("drm_prepare_basic: layer has no FB");
 		return -EINVAL;
 	}
 
@@ -858,10 +985,7 @@ drm_prepare_basic( struct drm_t *drm, const struct Composite_t *pComposite, cons
 
 	drm->fbids_in_req.push_back( fb_id );
 
-	if ( g_bRotated )
-	{
-		add_plane_property(req, drm->primary, "rotation", DRM_MODE_ROTATE_270);
-	}
+	add_plane_property(req, drm->primary, "rotation", g_bRotated ? DRM_MODE_ROTATE_270 : DRM_MODE_ROTATE_0);
 
 	add_plane_property(req, drm->primary, "FB_ID", fb_id);
 	add_plane_property(req, drm->primary, "CRTC_ID", drm->crtc->id);
@@ -897,11 +1021,13 @@ drm_prepare_basic( struct drm_t *drm, const struct Composite_t *pComposite, cons
 
 	gpuvis_trace_printf ( "crtc %li,%li %lix%li", crtcX, crtcY, crtcW, crtcH );
 
+	// TODO: disable all planes except drm->primary
+
 	unsigned test_flags = (drm->flags & DRM_MODE_ATOMIC_ALLOW_MODESET) | DRM_MODE_ATOMIC_TEST_ONLY;
 	int ret = drmModeAtomicCommit( drm->fd, drm->req, test_flags, NULL );
 
 	if ( ret != 0 && ret != -EINVAL && ret != -ERANGE ) {
-		fprintf( stderr, "drmModeAtomicCommit failed: %s", strerror( -ret ) );
+		drm_log.errorf_errno( "drmModeAtomicCommit failed" );
 	}
 
 	return ret;
@@ -916,8 +1042,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct Composite_t *pComposite, co
 		{
 			if ( pPipeline->layerBindings[ i ].fbid == 0 )
 			{
-				if ( s_drm_log != 0 )
-					fprintf( stderr, "drm_prepare_liftoff: layer %d has no FB", i );
+				drm_verbose_log.errorf("drm_prepare_liftoff: layer %d has no FB", i );
 				return -EINVAL;
 			}
 
@@ -952,9 +1077,9 @@ drm_prepare_liftoff( struct drm_t *drm, const struct Composite_t *pComposite, co
 				crtcY = x;
 				crtcW = crtcH;
 				crtcH = w;
-
-				liftoff_layer_set_property( drm->lo_layers[ i ], "rotation", DRM_MODE_ROTATE_270);
 			}
+
+			liftoff_layer_set_property( drm->lo_layers[ i ], "rotation", g_bRotated ? DRM_MODE_ROTATE_270 : DRM_MODE_ROTATE_0);
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "CRTC_X", crtcX);
 			liftoff_layer_set_property( drm->lo_layers[ i ], "CRTC_Y", crtcY);
@@ -982,13 +1107,10 @@ drm_prepare_liftoff( struct drm_t *drm, const struct Composite_t *pComposite, co
 			ret = -EINVAL;
 	}
 
-	if ( s_drm_log != 0 )
-	{
-		if ( ret == 0 )
-			fprintf( stderr, "can drm present %i layers\n", pComposite->nLayerCount );
-		else
-			fprintf( stderr, "can NOT drm present %i layers\n", pComposite->nLayerCount );
-	}
+	if ( ret == 0 )
+		drm_verbose_log.debugf( "can drm present %i layers", pComposite->nLayerCount );
+	else
+		drm_verbose_log.debugf( "can NOT drm present %i layers", pComposite->nLayerCount );
 
 	return ret;
 }
@@ -998,10 +1120,6 @@ drm_prepare_liftoff( struct drm_t *drm, const struct Composite_t *pComposite, co
 int drm_prepare( struct drm_t *drm, const struct Composite_t *pComposite, const struct VulkanPipeline_t *pPipeline )
 {
 	drm->fbids_in_req.clear();
-
-	bool out_of_date = drm->out_of_date.exchange(false);
-	if ( out_of_date )
-		refresh_state( drm );
 
 	bool needs_modeset = drm->needs_modeset.exchange(false);
 
@@ -1035,7 +1153,7 @@ int drm_prepare( struct drm_t *drm, const struct Composite_t *pComposite, const 
 			drm->crtcs[i].pending.active = 0;
 		}
 
-		// Then enable the ones we've picked
+		// Then enable the one we've picked
 
 		if (add_connector_property(drm->req, drm->connector, "CRTC_ID", drm->crtc->id) < 0)
 			return false;
@@ -1073,6 +1191,19 @@ int drm_prepare( struct drm_t *drm, const struct Composite_t *pComposite, const 
 	return ret;
 }
 
+bool drm_poll_state( struct drm_t *drm )
+{
+	bool out_of_date = drm->out_of_date.exchange(false);
+	if ( !out_of_date )
+		return false;
+
+	refresh_state( drm );
+
+	setup_best_connector(drm);
+
+	return true;
+}
+
 static bool drm_set_crtc( struct drm_t *drm, struct crtc *crtc )
 {
 	drm->crtc = crtc;
@@ -1087,20 +1218,35 @@ static bool drm_set_crtc( struct drm_t *drm, struct crtc *crtc )
 
 	drm->primary = find_primary_plane( drm );
 	if ( drm->primary == nullptr ) {
-		fprintf(stderr, "could not find a suitable primary plane\n");
+		drm_log.errorf("could not find a suitable primary plane");
 		return false;
 	}
+
+	struct liftoff_output *lo_output = liftoff_output_create( drm->lo_device, crtc->id );
+	if ( lo_output == nullptr )
+		return false;
+
+	for ( int i = 0; i < k_nMaxLayers; i++ )
+	{
+		liftoff_layer_destroy( drm->lo_layers[ i ] );
+		drm->lo_layers[ i ] = liftoff_layer_create( lo_output );
+		if ( drm->lo_layers[ i ] == nullptr )
+			return false;
+	}
+
+	liftoff_output_destroy( drm->lo_output );
+	drm->lo_output = lo_output;
 
 	return true;
 }
 
 bool drm_set_connector( struct drm_t *drm, struct connector *conn )
 {
-	fprintf( stderr, "drm: selecting connector %s\n", conn->name );
+	drm_log.infof("selecting connector %s", conn->name);
 
-	struct crtc *crtc = find_crtc_for_connector(drm, conn->connector);
+	struct crtc *crtc = find_crtc_for_connector(drm, conn);
 	if (crtc == nullptr) {
-		fprintf(stderr, "drm: no CRTC found!\n");
+		drm_log.errorf("no CRTC found!");
 		return false;
 	}
 
@@ -1109,6 +1255,7 @@ bool drm_set_connector( struct drm_t *drm, struct connector *conn )
 	}
 
 	drm->connector = conn;
+	drm->needs_modeset = true;
 
 	return true;
 }
@@ -1119,7 +1266,7 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 	if (drmModeCreatePropertyBlob(drm->fd, mode, sizeof(*mode), &mode_id) != 0)
 		return false;
 
-	fprintf( stderr, "drm: selecting mode %dx%d@%uHz\n", mode->hdisplay, mode->vdisplay, mode->vrefresh );
+	drm_log.infof("selecting mode %dx%d@%uHz", mode->hdisplay, mode->vdisplay, mode->vrefresh);
 
 	drm->pending.mode_id = mode_id;
 	drm->needs_modeset = true;
