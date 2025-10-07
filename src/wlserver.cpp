@@ -2615,20 +2615,14 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 	dx *= g_mouseSensitivity;
 	dy *= g_mouseSensitivity;
 
-	extern float focusedWindowScaleX;
-	extern float focusedWindowScaleY;
-	
-	if (focusedWindowScaleX != 0.0f && focusedWindowScaleY != 0.0f) {
-		dx /= focusedWindowScaleX;
-		dy /= focusedWindowScaleY;
-	}
-
-	wl_log.infof("mousemotion: orig(%.2f,%.2f) sens(%.2f) scale(%.2f,%.2f) final(%.2f,%.2f)", 
-		orig_dx, orig_dy, g_mouseSensitivity, focusedWindowScaleX, focusedWindowScaleY, dx, dy);
+	wl_log.infof("mousemotion: orig(%.2f,%.2f) sens(%.2f) final(%.2f,%.2f)", 
+		orig_dx, orig_dy, g_mouseSensitivity, dx, dy);
 
 	wlserver_perform_rel_pointer_motion( dx, dy );
 
-	if ( !wlserver_apply_constraint( &dx, &dy ) )
+	bool constraint_applied = wlserver_apply_constraint( &dx, &dy );
+	wl_log.infof("constraint_applied: %s, dx=%.2f, dy=%.2f", constraint_applied ? "true" : "false", dx, dy);
+	if ( !constraint_applied )
 	{
 		wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 		return;
