@@ -2618,8 +2618,10 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 	extern float focusedWindowScaleX;
 	extern float focusedWindowScaleY;
 	
-	dx *= focusedWindowScaleX;
-	dy *= focusedWindowScaleY;
+	if (focusedWindowScaleX != 0.0f && focusedWindowScaleY != 0.0f) {
+		dx /= focusedWindowScaleX;
+		dy /= focusedWindowScaleY;
+	}
 
 	wl_log.infof("mousemotion: orig(%.2f,%.2f) sens(%.2f) scale(%.2f,%.2f) final(%.2f,%.2f)", 
 		orig_dx, orig_dy, g_mouseSensitivity, focusedWindowScaleX, focusedWindowScaleY, dx, dy);
