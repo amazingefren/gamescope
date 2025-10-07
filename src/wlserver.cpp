@@ -2613,6 +2613,14 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 	dx *= g_mouseSensitivity;
 	dy *= g_mouseSensitivity;
 
+	// Apply coordinate transformation for stretch mode and other scaling
+	// to match the transformation applied to touch input
+	extern float focusedWindowScaleX;
+	extern float focusedWindowScaleY;
+	
+	dx *= focusedWindowScaleX;
+	dy *= focusedWindowScaleY;
+
 	wlserver_perform_rel_pointer_motion( dx, dy );
 
 	if ( !wlserver_apply_constraint( &dx, &dy ) )
