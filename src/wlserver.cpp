@@ -2610,16 +2610,19 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 {
 	assert( wlserver_is_lock_held() );
 
+	double orig_dx = dx, orig_dy = dy;
+
 	dx *= g_mouseSensitivity;
 	dy *= g_mouseSensitivity;
 
-	// Apply coordinate transformation for stretch mode and other scaling
-	// to match the transformation applied to touch input
 	extern float focusedWindowScaleX;
 	extern float focusedWindowScaleY;
 	
 	dx *= focusedWindowScaleX;
 	dy *= focusedWindowScaleY;
+
+	wl_log.infof("mousemotion: orig(%.2f,%.2f) sens(%.2f) scale(%.2f,%.2f) final(%.2f,%.2f)", 
+		orig_dx, orig_dy, g_mouseSensitivity, focusedWindowScaleX, focusedWindowScaleY, dx, dy);
 
 	wlserver_perform_rel_pointer_motion( dx, dy );
 
